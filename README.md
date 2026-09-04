@@ -146,6 +146,7 @@ llm.py                          Codex CLI 或兼容接口
 storage.py                      SQLite 去重和上下文
 policy.py                       联系人白名单、消息过滤、冷却
 wechat_autoreply/wechat_adapter.py  微信 4.x 适配器
+wechat_autoreply/background_sender.py  不移动鼠标的 UIAutomation 发送器
 install_wechat_adapter.ps1     安装第三方微信适配器
 tests/                          不依赖微信的单元测试
 data/                           本地数据库目录
