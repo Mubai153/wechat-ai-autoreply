@@ -48,6 +48,7 @@ class ReplyService:
         self.media_root = PROJECT_DIR / "data" / "media"
         self._last_media_cleanup = 0.0
         self._last_request: tuple[Any, str, str | None] | None = None
+        self._history_cache: list[dict[str, str]] = []
         self._stop_lock = threading.Lock()
         self._stopped = False
         self.worker = threading.Thread(target=self._worker, name="reply-worker", daemon=True)
@@ -76,6 +77,16 @@ class ReplyService:
         self._last_media_cleanup = now
         if removed:
             logger.info("图片缓存清理完成：删除=%s，释放=%s MB", removed, round(freed / 1024 / 1024, 2))
+
+    def _refresh_history(self, exclude_message_id: str | None = None) -> list[dict[str, str]]:
+        """从微信刷新真实双方对话，过滤程序自己的 AI 回复。"""
+        history = self.adapter.recent_history(
+            self.settings.max_history_messages,
+            exclude_message_id=exclude_message_id,
+        )
+        self._history_cache = history
+        logger.info("已从微信读取真实双方对话：%s 条（已过滤 AI 回复）", len(history))
+        return history
 
     def enqueue(self, message) -> None:
         if not is_target(message, self.settings.wechat_target):
@@ -106,7 +117,7 @@ class ReplyService:
                     continue
 
                 self._emit("policy_passed", reason=reason)
-                history = self.storage.recent_messages(message.chat_id, self.settings.max_history_messages)
+                history = self._refresh_history(exclude_message_id=message.message_id)
                 logger.info("开始调用 Codex 生成回复：history=%s", len(history))
                 self._emit("generating", history_count=len(history))
                 image_path = None
@@ -161,13 +172,7 @@ class ReplyService:
         if self._last_request is None:
             raise RuntimeError("还没有可重新生成的消息")
         message, prompt_message, image_path = self._last_request
-        history = self.storage.recent_messages(
-            message.chat_id, self.settings.max_history_messages
-        )
-        if history and history[-1].get("role") == "assistant":
-            history = history[:-1]
-        if history and history[-1].get("role") == "user":
-            history = history[:-1]
+        history = self._refresh_history(exclude_message_id=message.message_id)
         self._emit("generating", history_count=len(history), regenerated=True)
         reply = add_ai_prefix(
             self.generator.generate(history, prompt_message, image_path=image_path)
@@ -182,8 +187,35 @@ class ReplyService:
             input_content=message.content,
         )
 
+    def send_reply(self, reply: str) -> None:
+        """手动发送界面中当前的预览回复。
+
+        该操作是用户明确点击后的一次性发送，因此即使服务处于“仅预览”模式也允许。
+        """
+        if self._last_request is None:
+            raise RuntimeError("还没有可发送的回复")
+        text = reply.strip()
+        if not text:
+            raise RuntimeError("回复内容为空")
+        message = self._last_request[0]
+        self._emit("sending", reply=text, manual=True)
+        self.adapter.send_text(text)
+        # 写入本地状态以保持回复冷却逻辑一致；微信记忆层仍会过滤 AI 回复。
+        self.storage.add_message(message.chat_id, "assistant", text)
+        logger.info("已手动发送回复：%s", text)
+        self._emit(
+            "generated",
+            reply=text,
+            sent=True,
+            manual=True,
+            chat_name=message.chat_name,
+            input_content=message.content,
+        )
+
     def run(self) -> None:
         self._maybe_cleanup_media(force=True)
+        # 监听前即预加载，保证启动后第一次回复就有聊天记忆。
+        self._refresh_history()
         self.worker.start()
         self.adapter.listen(self.enqueue)
         logger.info("服务已启动。dry-run=%s，按 Ctrl+C 停止。", self.dry_run)

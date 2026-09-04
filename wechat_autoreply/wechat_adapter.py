@@ -39,6 +39,11 @@ def _is_outgoing(raw: dict[str, Any]) -> bool:
         return False
 
 
+def _is_ai_reply(content: str) -> bool:
+    """自动回复都由发送层统一加前缀，以此与用户手动发言区分。"""
+    return content.lstrip().startswith(("AI：", "AI:"))
+
+
 class ShardedWeChatDB:
     """让 wechatauto 的监听器合并同一会话分布在多个消息库的记录。
 
@@ -212,6 +217,8 @@ class WeChatAdapter:
         content = _first(raw, "content", "Content", "text", "msg", "message")
         if local_type == 3:
             content = "[图片]"
+        elif local_type == 47:
+            content = "[动画表情]"
         if not content:
             return None
         chat_id = _first(raw, "chat_id", "talker_id", "username", "UserName", default=self.target_username)
@@ -233,6 +240,8 @@ class WeChatAdapter:
             created_at = datetime.now(timezone.utc)
         if local_type == 3:
             message_type = "图片"
+        elif local_type == 47:
+            message_type = "动画表情"
         elif local_type == 1:
             message_type = "文本"
         else:
@@ -275,6 +284,63 @@ class WeChatAdapter:
         self.listener.add_listener(self.target_username, on_raw)
         logger.info("开始监听联系人：%s (%s)", self.settings.wechat_target, self.target_username)
         self.listener.start()
+
+    def recent_history(
+        self,
+        limit: int = 100,
+        *,
+        exclude_message_id: str | None = None,
+    ) -> list[dict[str, str]]:
+        """读取最近的真实双方对话，按时间正序返回给模型。
+
+        对方消息和用户手动发出的消息都保留，仅过滤带
+        ``AI：`` / ``AI:`` 前缀的程序自动回复。
+        数据库是“最新在前”，因此先向前分页收集足够的
+        对方消息，再反转成模型需要的时间正序。
+        """
+        if limit <= 0:
+            return []
+
+        newest_first: list[dict[str, str]] = []
+        offset = 0
+        batch_size = max(100, limit)
+        while len(newest_first) < limit:
+            raw_messages = self.db.get_messages(
+                self.target_username,
+                limit=batch_size,
+                offset=offset,
+            )
+            if not raw_messages:
+                break
+            for raw in raw_messages:
+                if not isinstance(raw, dict):
+                    continue
+                message = self._normalize(raw)
+                if message is None or message.message_id == exclude_message_id:
+                    continue
+                content = message.content.strip()
+                outgoing = _is_outgoing(raw)
+                if outgoing and _is_ai_reply(content):
+                    continue
+                if message.is_image:
+                    content = "[图片]"
+                elif message.is_emoji:
+                    content = "[动画表情]"
+                if not content:
+                    continue
+                newest_first.append(
+                    {
+                        "role": "assistant" if outgoing else "user",
+                        "content": content,
+                    }
+                )
+                if len(newest_first) >= limit:
+                    break
+            offset += len(raw_messages)
+            if len(raw_messages) < batch_size:
+                break
+
+        return list(reversed(newest_first))
 
     def stop(self) -> None:
         self.listener.stop()

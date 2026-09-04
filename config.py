@@ -85,7 +85,7 @@ class Settings:
             wechat_target=os.getenv("WECHAT_TARGET", "").strip(),
             auto_send=_bool("AUTO_SEND", False),
             reply_cooldown_seconds=max(0, _int("REPLY_COOLDOWN_SECONDS", 0)),
-            max_history_messages=max(0, _int("MAX_HISTORY_MESSAGES", 12)),
+            max_history_messages=max(0, _int("MAX_HISTORY_MESSAGES", 100)),
             max_reply_chars=max(1, _int("MAX_REPLY_CHARS", 500)),
             max_input_chars=max(1, _int("MAX_INPUT_CHARS", 4000)),
             database_path=database_path,

@@ -118,7 +118,7 @@ python main.py --send
 
 打包版同时把关键日志写入 `dist\微信自动回复\logs\wechat_autoreply.log`，日志文件最大 2 MB，并保留 3 份轮转备份。即使控制台意外关闭，也可以从这里排查最近一次启动和回复结果。
 
-配置中的 `REPLY_COOLDOWN_SECONDS` 可限制连续回复频率，设为 `0` 表示关闭冷却、每条新消息都允许回复；SQLite 数据保存在 `data/wechat_autoreply.sqlite3`。不要把 `.env`、数据库、聊天日志提交到 Git。
+配置中的 `REPLY_COOLDOWN_SECONDS` 可限制连续回复频率，设为 `0` 表示关闭冷却、每条新消息都允许回复。`MAX_HISTORY_MESSAGES` 默认为 `100`；程序启动时会预读微信中最近 100 条真实双方对话，每次生成回复前再刷新一次作为模型记忆。对方消息和你手动发出的消息都会读入，只过滤带 `AI：` / `AI:` 前缀的程序自动回复。SQLite 数据保存在 `data/wechat_autoreply.sqlite3`。不要把 `.env`、数据库、聊天日志提交到 Git。
 
 启用 `IMAGE_RECOGNITION_ENABLED=true` 后，收到图片时会从微信本地缓存解密图片并随本次请求附加给视觉模型。图片只临时保存在 `data/media/`；程序启动时及运行期间会按 `MEDIA_RETENTION_DAYS`、`MEDIA_CACHE_MAX_MB` 和 `MEDIA_CLEANUP_INTERVAL_SECONDS` 自动清理，默认保留 7 天且最多 512 MB。清理不会触碰微信原始数据库、聊天 JSON 或语气画像。
 

@@ -450,7 +450,10 @@ class AutoReplyApp:
         reply_actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.reply_meta = tk.Label(reply_actions, text="Codex  ·  等待消息", bg=COLORS["green_pale"], fg=COLORS["muted"], font=(MONO, 8))
         self.reply_meta.pack(side="left")
-        self._button(reply_actions, "重新生成", self._regenerate, primary=True).pack(side="right", padx=(8, 0))
+        self.send_reply_button = self._button(reply_actions, "发送回复", self._send_reply, primary=True)
+        self.send_reply_button.pack(side="right", padx=(8, 0))
+        self.send_reply_button.configure(state="disabled")
+        self._button(reply_actions, "重新生成", self._regenerate).pack(side="right", padx=(8, 0))
         self._button(reply_actions, "复制回复", self._copy_reply).pack(side="right")
 
         runtime = self._card(middle, row=0, column=1, sticky="nsew")
@@ -506,7 +509,7 @@ class AutoReplyApp:
                 "rules", "回复规则", "控制回复频率、上下文范围与输出边界。",
                 (
                     ("回复冷却（秒）", "REPLY_COOLDOWN_SECONDS", "entry", "0 表示每条新消息都允许回复"),
-                    ("上下文消息数", "MAX_HISTORY_MESSAGES", "entry", "生成回复时携带的最近消息数量"),
+                    ("上下文消息数", "MAX_HISTORY_MESSAGES", "entry", "启动时及每次回复前读取的真实双方消息数量（过滤 AI 回复）"),
                     ("最大回复字数", "MAX_REPLY_CHARS", "entry", "超出后由模型层截断"),
                     ("最大输入字数", "MAX_INPUT_CHARS", "entry", "过长消息将被安全跳过"),
                     ("回复指令", "SYSTEM_PROMPT", "text", "定义语气、边界与回复原则"),
@@ -767,6 +770,9 @@ class AutoReplyApp:
         self.preview_button.configure(bg=COLORS["soft"] if auto else COLORS["green_soft"], fg=COLORS["muted"] if auto else COLORS["green_dark"])
         self.send_button.configure(bg=COLORS["green_soft"] if auto else COLORS["soft"], fg=COLORS["green_dark"] if auto else COLORS["muted"])
         self.mode_hint.configure(text="回复将自动发送给对方" if auto else "回复不会发给对方", fg=COLORS["danger"] if auto else COLORS["muted"])
+        if hasattr(self, "send_reply_button"):
+            can_send = bool(self.last_reply and self.service is not None and not auto)
+            self.send_reply_button.configure(state="normal" if can_send else "disabled")
 
     def _set_mode(self, auto: bool) -> None:
         if auto and not self.mode_auto.get():
@@ -862,6 +868,7 @@ class AutoReplyApp:
             self.incoming_text.configure(text=payload.get("content", ""))
             self.reply_status.configure(text="正在处理")
             self.reply_text.configure(text="正在检查回复规则…")
+            self.send_reply_button.configure(state="disabled")
             self.pipeline.set_stage(0, now, "done")
             self._add_activity(f"收到来自 {payload.get('chat_name', '目标联系人')} 的{payload.get('message_type', '文本')}消息", "success")
         elif event == "policy_passed":
@@ -879,11 +886,13 @@ class AutoReplyApp:
             reply = str(payload.get("reply", ""))
             self.last_reply = reply
             sent = bool(payload.get("sent"))
+            manual = bool(payload.get("manual"))
             self.reply_text.configure(text=reply)
-            self.reply_status.configure(text="已自动发送" if sent else "AI 回复预览 · 未发送")
+            self.reply_status.configure(text=("已发送" if manual else "已自动发送") if sent else "AI 回复预览 · 未发送")
             self.reply_meta.configure(text=f"Codex  ·  {len(reply)} 字")
             self.pipeline.set_stage(3, "已发送" if sent else "仅预览", "done" if sent else "idle")
-            self._add_activity("已自动发送回复" if sent else "已生成回复，仅预览未发送", "success")
+            self.send_reply_button.configure(state="disabled" if sent or self.mode_auto.get() else "normal")
+            self._add_activity(("已手动发送回复" if manual else "已自动发送回复") if sent else "已生成回复，仅预览未发送", "success")
         elif event == "skipped":
             reason = str(payload.get("reason", "不符合回复条件"))
             self.pipeline.set_stage(1, reason, "idle")
@@ -894,6 +903,8 @@ class AutoReplyApp:
             message = str(payload.get("message", "未知错误"))
             self.reply_status.configure(text="处理失败", fg=COLORS["danger"])
             self.reply_text.configure(text=message)
+            if hasattr(self, "send_reply_button") and self.last_reply and not self.mode_auto.get():
+                self.send_reply_button.configure(state="normal")
             self.service_title.configure(text="启动失败" if event == "service_error" else "运行异常")
             self.top_connection.configure(text="●  需要处理", fg=COLORS["danger"])
             self._add_activity(message, "error")
@@ -945,6 +956,8 @@ class AutoReplyApp:
         self.top_connection.configure(text="●  未连接", fg=COLORS["muted"])
         for value in self.runtime_values.values():
             value.configure(text="未检查", fg=COLORS["muted"])
+        if hasattr(self, "send_reply_button"):
+            self.send_reply_button.configure(state="disabled")
 
     def _regenerate(self) -> None:
         service = self.service
@@ -957,6 +970,24 @@ class AutoReplyApp:
             except Exception as exc:
                 self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
         threading.Thread(target=run, name="gui-regenerate", daemon=True).start()
+
+    def _send_reply(self) -> None:
+        service = self.service
+        if service is None:
+            messagebox.showinfo("无法发送", "请先启动监听，并等待生成一条回复。", parent=self.root)
+            return
+        if not self.last_reply:
+            messagebox.showinfo("暂无回复", "目前没有可发送的回复。", parent=self.root)
+            return
+        self.send_reply_button.configure(state="disabled")
+
+        def run() -> None:
+            try:
+                service.send_reply(self.last_reply)
+            except Exception as exc:
+                self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
+
+        threading.Thread(target=run, name="gui-send-reply", daemon=True).start()
 
     def _copy_reply(self) -> None:
         if not self.last_reply:
