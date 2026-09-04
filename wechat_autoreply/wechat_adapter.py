@@ -127,6 +127,7 @@ class WeChatAdapter:
         self._WeChatDB = WeChatDB
         self._Listener = Listener
         self._quick_send = quick_send
+        self._background_sender = None
         self.db = ShardedWeChatDB(WeChatDB)
         self.target_username = self._resolve_target()
         self.listener = Listener(self.db, interval=1.0)
@@ -229,9 +230,29 @@ class WeChatAdapter:
         self.listener.stop()
 
     def send_text(self, text: str) -> None:
+        # 默认使用项目内的无鼠标 UIA 路径。只有显式允许时才回退到上游
+        # 坐标/OCR 方案；这样 UIA 不可用时会快速报错，不会突然抢鼠标。
+        settings = getattr(self, "settings", None)
+        background_mode = getattr(settings, "wechat_background_mode", False)
+        allow_mouse_fallback = getattr(settings, "wechat_allow_mouse_fallback", True)
+        if background_mode:
+            if self._background_sender is None:
+                from wechat_autoreply.background_sender import BackgroundWeChatSender
+
+                self._background_sender = BackgroundWeChatSender(self.target_username)
+                logger.info("已初始化后台 UIA 发送器（不使用鼠标点击）")
+            try:
+                result = self._background_sender.send_text(text)
+            except Exception:
+                if not allow_mouse_fallback:
+                    raise
+                logger.warning("后台 UIA 发送失败，按配置回退坐标/OCR 发送", exc_info=True)
+                result = self._quick_send(text, self.target_username, verify=False)
+        else:
+            result = self._quick_send(text, self.target_username, verify=False)
+
         # 上游 verify=True 只按 real_sender_id==2 判断自己发送，但该数字会随
         # message_N.db 分片变化。本项目改用稳定的 origin_source=1 自行回读。
-        result = self._quick_send(text, self.target_username, verify=False)
         failed = (
             result.get("status") != "成功"
             if isinstance(result, dict) and "status" in result

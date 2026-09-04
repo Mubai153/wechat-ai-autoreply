@@ -52,6 +52,9 @@ class Settings:
     database_path: Path
     system_prompt: str
     log_level: str
+    # 放在末尾并提供默认值，保持外部脚本直接构造 Settings 的兼容性。
+    wechat_background_mode: bool = True
+    wechat_allow_mouse_fallback: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,6 +81,8 @@ class Settings:
                 "你是我的微信聊天助手。用自然、简洁、友好的中文回复。",
             ).strip(),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            wechat_background_mode=_bool("WECHAT_BACKGROUND_MODE", True),
+            wechat_allow_mouse_fallback=_bool("WECHAT_ALLOW_MOUSE_FALLBACK", False),
         )
 
     def validate(self) -> None:

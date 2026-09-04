@@ -51,6 +51,14 @@ WECHAT_TARGET=对方在微信中的唯一备注名
 
 Codex CLI 会使用当前 Codex 配置中的默认模型；如需指定模型，可填写 `CODEX_MODEL`。每条消息都会启动一次临时、只读的 `codex exec` 会话，使用你的 ChatGPT/Codex 套餐额度，调用速度和可用次数受账户限制。
 
+### 无鼠标发送
+
+发送默认使用 UIAutomation 后台路径：通过 UIA 的 `ValuePattern` 和
+`InvokePattern` 写入/发送，不调用坐标点击，也不会移动鼠标；发送器会在多条回复
+之间复用同一个 UIA 会话。若微信版本暂时没有暴露输入框，日志会明确提示失败，
+不会悄悄抢鼠标。只有在 `.env` 中显式设置
+`WECHAT_ALLOW_MOUSE_FALLBACK=true` 才允许回退到旧的坐标/OCR 兼容路径。
+
 ### 可选：兼容接口
 
 如果以后改用其他兼容服务，可配置：
