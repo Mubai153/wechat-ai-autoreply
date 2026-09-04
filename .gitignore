@@ -5,10 +5,17 @@ __pycache__/
 .env
 data/*.db
 data/*.sqlite3
+data/raw/
+data/contacts/
+data/media/
+data/media_test/
+data/persona.json
+data/persona_prompt.md
 data/logs/
 .vendor/
 build/
 dist/
+design-review/
 logs/
 wechatauto_logs/
 *.log

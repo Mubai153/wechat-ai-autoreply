@@ -22,7 +22,12 @@ def should_reply(
     settings: Settings,
     storage: Storage,
 ) -> tuple[bool, str]:
-    if not message.is_text:
+    if message.is_emoji:
+        return False, "动画表情暂不支持图片识别"
+    if message.is_image:
+        if not settings.image_recognition_enabled:
+            return False, "非文本消息"
+    elif not message.is_text:
         return False, "非文本消息"
     if len(message.content) > settings.max_input_chars:
         return False, "消息过长"
@@ -35,4 +40,3 @@ def should_reply(
         if elapsed < settings.reply_cooldown_seconds:
             return False, f"冷却中（还需 {settings.reply_cooldown_seconds - int(elapsed)} 秒）"
     return True, "通过"
-

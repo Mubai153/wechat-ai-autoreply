@@ -55,12 +55,25 @@ class Settings:
     # 放在末尾并提供默认值，保持外部脚本直接构造 Settings 的兼容性。
     wechat_background_mode: bool = True
     wechat_allow_mouse_fallback: bool = False
+    # 可选的离线语气画像；为空时保持原有行为。
+    persona_path: Path | None = None
+    image_recognition_enabled: bool = False
+    media_retention_days: int = 7
+    media_cache_max_mb: int = 512
+    media_cleanup_interval_seconds: int = 3600
 
     @classmethod
     def from_env(cls) -> "Settings":
         database_path = Path(os.getenv("DATABASE_PATH", "data/wechat_autoreply.sqlite3"))
         if not database_path.is_absolute():
             database_path = PROJECT_DIR / database_path
+
+        persona_raw = os.getenv("PERSONA_PATH", "").strip()
+        persona_path = None
+        if persona_raw:
+            persona_path = Path(persona_raw)
+            if not persona_path.is_absolute():
+                persona_path = PROJECT_DIR / persona_path
 
         return cls(
             llm_provider=os.getenv("LLM_PROVIDER", "codex_cli").strip().lower(),
@@ -83,6 +96,11 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             wechat_background_mode=_bool("WECHAT_BACKGROUND_MODE", True),
             wechat_allow_mouse_fallback=_bool("WECHAT_ALLOW_MOUSE_FALLBACK", False),
+            persona_path=persona_path,
+            image_recognition_enabled=_bool("IMAGE_RECOGNITION_ENABLED", False),
+            media_retention_days=max(0, _int("MEDIA_RETENTION_DAYS", 7)),
+            media_cache_max_mb=max(0, _int("MEDIA_CACHE_MAX_MB", 512)),
+            media_cleanup_interval_seconds=max(60, _int("MEDIA_CLEANUP_INTERVAL_SECONDS", 3600)),
         )
 
     def validate(self) -> None:

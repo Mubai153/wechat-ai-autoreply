@@ -98,12 +98,48 @@ class ShardedWeChatDB:
         rows = self._rows(user, limit=max(limit + offset, limit))
         return [self._to_dict(row) for row in rows[offset:offset + limit]]
 
+    def get_message_row(self, user: str, local_id: int) -> dict[str, Any] | None:
+        """跨所有 message_N.db 分片读取媒体下载所需的完整消息行。"""
+        table = self._table(user)
+        for rel in self._db._message_dbs():
+            conn = self._db._open(rel)
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                if not exists:
+                    continue
+                row = conn.execute(
+                    f"SELECT local_id, local_type, server_id, real_sender_id, create_time, "
+                    f"message_content, source, packed_info_data, compress_content, sort_seq "
+                    f"FROM \"{table}\" WHERE local_id=? LIMIT 1",
+                    (int(local_id),),
+                ).fetchone()
+                if row:
+                    return {
+                        "local_id": row["local_id"],
+                        "local_type": row["local_type"],
+                        "server_id": row["server_id"],
+                        "sender_id": row["real_sender_id"],
+                        "create_time": row["create_time"],
+                        "content": row["message_content"],
+                        "source": row["source"],
+                        "packed_info": row["packed_info_data"],
+                        "compress_content": row["compress_content"],
+                        "sort_seq": row["sort_seq"],
+                    }
+            finally:
+                conn.close()
+        return None
+
     def get_new_messages(self, user: str, since_seq: int = 0, limit: int = 200) -> list[dict]:
         rows = self._rows(user, since_seq=since_seq, limit=limit)
         return [self._to_dict(row) for row in rows]
 
     def _to_dict(self, row: Any) -> dict[str, Any]:
         message = self._db._msg_row_to_dict(row)
+        message["local_type"] = row["local_type"]
         message["origin_source"] = row["origin_source"]
         message["status"] = row["status"]
         return message
@@ -168,7 +204,14 @@ class WeChatAdapter:
         )
 
     def _normalize(self, raw: dict[str, Any]) -> IncomingMessage | None:
+        local_type = raw.get("local_type", raw.get("localType"))
+        try:
+            local_type = int(local_type) if local_type is not None else None
+        except (TypeError, ValueError):
+            local_type = None
         content = _first(raw, "content", "Content", "text", "msg", "message")
+        if local_type == 3:
+            content = "[图片]"
         if not content:
             return None
         chat_id = _first(raw, "chat_id", "talker_id", "username", "UserName", default=self.target_username)
@@ -188,6 +231,12 @@ class WeChatAdapter:
             created_at = datetime.fromtimestamp(float(created), tz=timezone.utc) if created else datetime.now(timezone.utc)
         except (TypeError, ValueError):
             created_at = datetime.now(timezone.utc)
+        if local_type == 3:
+            message_type = "图片"
+        elif local_type == 1:
+            message_type = "文本"
+        else:
+            message_type = _first(raw, "type", "msg_type", default="文本")
         return IncomingMessage(
             message_id=message_id,
             chat_id=chat_id,
@@ -196,7 +245,8 @@ class WeChatAdapter:
             sender_name=sender_name,
             content=content,
             created_at=created_at,
-            message_type=_first(raw, "type", "msg_type", default="文本"),
+            message_type=message_type,
+            local_id=int(local_id) if local_id.isdigit() else None,
         )
 
     def listen(self, callback: Callable[[IncomingMessage], None]) -> None:
@@ -272,3 +322,10 @@ class WeChatAdapter:
                 return
             time.sleep(0.5)
         raise RuntimeError("微信已执行发送操作，但数据库未确认该消息")
+
+    def download_image(self, local_id: int, save_dir: str) -> str | None:
+        """读取并解密一条图片消息，失败时返回 None。"""
+        from wechatauto.media import MediaDownloader
+
+        downloader = MediaDownloader(self.db, save_dir=save_dir)
+        return downloader.download_image(self.target_username, int(local_id), save_dir=save_dir)

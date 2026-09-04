@@ -84,7 +84,15 @@ python main.py --send
 
 ## 运行
 
-先启动并登录微信桌面端，再运行：
+先启动并登录微信桌面端。直接运行且不带参数时会打开本地桌面控制台：
+
+```powershell
+python main.py
+```
+
+控制台可以启动/停止监听、切换“仅生成预览”和“自动发送”、查看消息处理流水线、修改配置、筛选日志并清理图片缓存。配置未完成时也能先打开界面，在“联系人与语气”等页面中补齐后再启动监听。
+
+如需保持原来的纯命令行运行方式，可使用：
 
 ```powershell
 python main.py --dry-run
@@ -96,6 +104,8 @@ python main.py --dry-run
 python main.py --send
 ```
 
+也可以使用 `python main.py --headless` 按 `.env` 中的 `AUTO_SEND` 配置运行。
+
 ## 打包为可点击应用
 
 在项目目录运行一次：
@@ -104,11 +114,15 @@ python main.py --send
 .\build_app.ps1
 ```
 
-之后双击项目目录中的 `启动微信自动回复.lnk`，或双击 `dist\微信自动回复\微信自动回复.exe`，即可启动整套服务。应用会打开一个日志窗口；请保持微信桌面端和 Codex CLI 登录状态。`.env` 会被复制到应用目录，修改配置后需要重新复制配置或重新打包。
+之后双击项目目录中的 `启动微信自动回复.lnk`，或双击 `dist\微信自动回复\微信自动回复.exe`，即可打开桌面控制台，再点击“开始监听”。请保持微信桌面端和 Codex CLI 登录状态。`.env` 会被复制到应用目录；也可以直接在控制台中修改打包版配置。
 
-打包版同时把关键日志写入 `dist\微信自动回复\logs\wechat_autoreply.log`，日志文件最大 2 MB，并保留 3 份轮转备份。即使日志窗口意外关闭，也可以从这里排查最近一次启动和回复结果。
+打包版同时把关键日志写入 `dist\微信自动回复\logs\wechat_autoreply.log`，日志文件最大 2 MB，并保留 3 份轮转备份。即使控制台意外关闭，也可以从这里排查最近一次启动和回复结果。
 
 配置中的 `REPLY_COOLDOWN_SECONDS` 可限制连续回复频率，设为 `0` 表示关闭冷却、每条新消息都允许回复；SQLite 数据保存在 `data/wechat_autoreply.sqlite3`。不要把 `.env`、数据库、聊天日志提交到 Git。
+
+启用 `IMAGE_RECOGNITION_ENABLED=true` 后，收到图片时会从微信本地缓存解密图片并随本次请求附加给视觉模型。图片只临时保存在 `data/media/`；程序启动时及运行期间会按 `MEDIA_RETENTION_DAYS`、`MEDIA_CACHE_MAX_MB` 和 `MEDIA_CLEANUP_INTERVAL_SECONDS` 自动清理，默认保留 7 天且最多 512 MB。清理不会触碰微信原始数据库、聊天 JSON 或语气画像。
+
+普通图片（微信类型码 3）支持本地解密和视觉理解；动画表情（类型码 47）目前仍会跳过，因为它需要通过微信界面截图才能准确取得图像。
 
 ## 检查和测试
 

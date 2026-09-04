@@ -84,6 +84,23 @@ def test_non_text_message_is_skipped(tmp_path: Path):
     assert reason == "非文本消息"
 
 
+def test_animated_emoji_is_reported_separately(tmp_path: Path):
+    store = Storage(tmp_path / "test.sqlite3")
+    msg = IncomingMessage(
+        message_id="emoji-1",
+        chat_id="wxid_xiaoming",
+        chat_name="小明",
+        sender_id="wxid_xiaoming",
+        sender_name="小明",
+        content="[动画表情]",
+        created_at=datetime.now(timezone.utc),
+        message_type="动画表情",
+    )
+    allowed, reason = should_reply(msg, settings(tmp_path), store)
+    assert not allowed
+    assert reason == "动画表情暂不支持图片识别"
+
+
 def test_send_failure_is_not_reported_as_success():
     adapter = WeChatAdapter.__new__(WeChatAdapter)
     adapter.target_username = "wxid_test"
