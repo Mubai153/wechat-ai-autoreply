@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+data/*.db
+data/*.sqlite3
+data/logs/
+.vendor/
+build/
+dist/
+logs/
+wechatauto_logs/
+*.log
+*.lnk
