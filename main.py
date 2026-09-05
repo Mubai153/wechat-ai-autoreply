@@ -18,6 +18,7 @@ from wechat_autoreply.wechat_adapter import WeChatAdapter
 
 
 logger = logging.getLogger("wechat-autoreply")
+_WORKER_STOP = object()
 
 
 def add_ai_prefix(reply: str) -> str:
@@ -43,15 +44,31 @@ class ReplyService:
         self.storage = Storage(settings.database_path)
         self.generator = ReplyGenerator(settings)
         self.adapter = WeChatAdapter(settings)
-        self.queue: queue.Queue = queue.Queue()
+        self.queue: queue.Queue = queue.Queue()  # 兼容旧版外部调用方
+        self.worker_queues: dict[str, queue.Queue] = {
+            username: queue.Queue()
+            for username in self.adapter.target_usernames.values()
+        }
+        self.workers: dict[str, threading.Thread] = {
+            username: threading.Thread(
+                target=self._worker,
+                args=(username, work_queue),
+                name=f"reply-worker-{username}",
+                daemon=True,
+            )
+            for username, work_queue in self.worker_queues.items()
+        }
+        # 保留 worker 属性，兼容旧版 GUI/调用方检查服务线程状态的代码。
+        self.worker = next(iter(self.workers.values()), None)
         self.stop_event = threading.Event()
         self.media_root = PROJECT_DIR / "data" / "media"
         self._last_media_cleanup = 0.0
         self._last_request: tuple[Any, str, str | None] | None = None
-        self._history_cache: list[dict[str, str]] = []
+        self._requests: dict[str, tuple[Any, str, str | None]] = {}
+        self._history_cache: dict[str, list[dict[str, str]]] = {}
+        self._state_lock = threading.RLock()
         self._stop_lock = threading.Lock()
         self._stopped = False
-        self.worker = threading.Thread(target=self._worker, name="reply-worker", daemon=True)
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self.event_callback is None:
@@ -78,19 +95,39 @@ class ReplyService:
         if removed:
             logger.info("图片缓存清理完成：删除=%s，释放=%s MB", removed, round(freed / 1024 / 1024, 2))
 
-    def _refresh_history(self, exclude_message_id: str | None = None) -> list[dict[str, str]]:
+    def _refresh_history(
+        self,
+        chat_id: str | None = None,
+        exclude_message_id: str | None = None,
+    ) -> list[dict[str, str]]:
         """从微信刷新真实双方对话，过滤程序自己的 AI 回复。"""
         history = self.adapter.recent_history(
             self.settings.max_history_messages,
             exclude_message_id=exclude_message_id,
+            chat_id=chat_id,
         )
-        self._history_cache = history
-        logger.info("已从微信读取真实双方对话：%s 条（已过滤 AI 回复）", len(history))
+        cache_key = chat_id or self.adapter.target_username
+        with self._state_lock:
+            self._history_cache[cache_key] = history
+        logger.info(
+            "已从 %s 读取真实双方对话：%s 条（已过滤 AI 回复）",
+            chat_id or "目标联系人",
+            len(history),
+        )
         return history
 
     def enqueue(self, message) -> None:
-        if not is_target(message, self.settings.wechat_target):
+        if not is_target(message, self.settings.target_contacts):
             logger.debug("忽略非目标联系人消息：%s", message.chat_name)
+            return
+        chat_id = self.adapter.target_username_for(message.chat_id, message.chat_name) or message.chat_id
+        work_queue = self.worker_queues.get(chat_id)
+        if work_queue is None:
+            logger.warning(
+                "忽略未注册的目标会话：chat_id=%s, chat_name=%s",
+                message.chat_id,
+                message.chat_name,
+            )
             return
         logger.info("已加入回复队列：chat=%s, message_id=%s", message.chat_name, message.message_id)
         self._emit(
@@ -99,27 +136,53 @@ class ReplyService:
             content=message.content,
             message_type=message.message_type,
             created_at=message.created_at.isoformat(),
+            message_id=message.message_id,
+            chat_id=message.chat_id,
         )
-        self.queue.put(message)
+        work_queue.put(message)
 
-    def _worker(self) -> None:
+    def _worker(self, chat_id: str, work_queue: queue.Queue) -> None:
         while not self.stop_event.is_set():
             try:
-                message = self.queue.get(timeout=0.5)
+                message = work_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if message is _WORKER_STOP:
+                work_queue.task_done()
+                break
             try:
                 allowed, reason = should_reply(message, self.settings, self.storage)
                 self.storage.mark_processed(message.message_id, message.chat_id, message.content)
                 if not allowed:
                     logger.info("跳过消息：%s", reason)
-                    self._emit("skipped", reason=reason)
+                    self._emit(
+                        "skipped",
+                        reason=reason,
+                        chat_name=message.chat_name,
+                        chat_id=message.chat_id,
+                        message_id=message.message_id,
+                    )
                     continue
 
-                self._emit("policy_passed", reason=reason)
-                history = self._refresh_history(exclude_message_id=message.message_id)
-                logger.info("开始调用 Codex 生成回复：history=%s", len(history))
-                self._emit("generating", history_count=len(history))
+                self._emit(
+                    "policy_passed",
+                    reason=reason,
+                    chat_name=message.chat_name,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                )
+                history = self._refresh_history(
+                    chat_id=message.chat_id,
+                    exclude_message_id=message.message_id,
+                )
+                logger.info("开始调用模型服务生成回复：history=%s", len(history))
+                self._emit(
+                    "generating",
+                    history_count=len(history),
+                    chat_name=message.chat_name,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                )
                 image_path = None
                 prompt_message = message.content
                 if message.is_image and self.settings.image_recognition_enabled:
@@ -128,13 +191,26 @@ class ReplyService:
                     if message.local_id is None:
                         logger.info("图片消息缺少 local_id，跳过图片识别")
                         continue
-                    image_path = self.adapter.download_image(message.local_id, str(media_dir))
+                    image_path = self.adapter.download_image(
+                        message.local_id,
+                        str(media_dir),
+                        chat_id=message.chat_id,
+                    )
                     if not image_path:
                         logger.info("本地未找到或无法解密图片，跳过本条消息")
-                        self._emit("skipped", reason="本地未找到或无法解密图片")
+                        self._emit(
+                            "skipped",
+                            reason="本地未找到或无法解密图片",
+                            chat_name=message.chat_name,
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                        )
                         continue
                     prompt_message = "对方发送了一张图片。请先理解图片内容，再按我的语气回复。"
-                self._last_request = (message, prompt_message, image_path)
+                request = (message, prompt_message, image_path)
+                with self._state_lock:
+                    self._last_request = request
+                    self._requests[message.message_id] = request
                 reply = add_ai_prefix(
                     self.generator.generate(history, prompt_message, image_path=image_path)
                 )
@@ -147,33 +223,67 @@ class ReplyService:
                         reply=reply,
                         sent=False,
                         chat_name=message.chat_name,
+                        chat_id=message.chat_id,
+                        message_id=message.message_id,
                         input_content=message.content,
                     )
                 else:
-                    self._emit("sending", reply=reply)
-                    self.adapter.send_text(reply)
+                    self._emit(
+                        "sending",
+                        reply=reply,
+                        chat_name=message.chat_name,
+                        chat_id=message.chat_id,
+                        message_id=message.message_id,
+                    )
+                    self._send_message(message, reply)
                     logger.info("已自动回复：%s", reply)
                     self._emit(
                         "generated",
                         reply=reply,
                         sent=True,
                         chat_name=message.chat_name,
+                        chat_id=message.chat_id,
+                        message_id=message.message_id,
                         input_content=message.content,
                     )
                 self.storage.add_message(message.chat_id, "assistant", reply)
             except Exception as exc:
                 logger.exception("处理消息失败；本条消息不会自动重试")
-                self._emit("error", message=str(exc))
+                self._emit(
+                    "error",
+                    message=str(exc),
+                    chat_name=message.chat_name,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                )
             finally:
-                self.queue.task_done()
+                work_queue.task_done()
 
-    def regenerate_last(self) -> None:
+    def _send_message(self, message: Any, text: str) -> None:
+        """按消息会话路由发送；兼容旧版只接受一个参数的适配器。"""
+        send_to = getattr(self.adapter, "send_to", None)
+        if callable(send_to):
+            send_to(text, chat_id=message.chat_id, chat_name=message.chat_name)
+        else:  # pragma: no cover - 仅兼容外部旧适配器
+            self.adapter.send_text(text)
+
+    def regenerate_last(self, message_id: str | None = None) -> None:
         """重新生成最近一条回复，仅供界面预览，绝不自动发送。"""
-        if self._last_request is None:
+        request = self._request_for(message_id)
+        if request is None:
             raise RuntimeError("还没有可重新生成的消息")
-        message, prompt_message, image_path = self._last_request
-        history = self._refresh_history(exclude_message_id=message.message_id)
-        self._emit("generating", history_count=len(history), regenerated=True)
+        message, prompt_message, image_path = request
+        history = self._refresh_history(
+            chat_id=message.chat_id,
+            exclude_message_id=message.message_id,
+        )
+        self._emit(
+            "generating",
+            history_count=len(history),
+            regenerated=True,
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
         reply = add_ai_prefix(
             self.generator.generate(history, prompt_message, image_path=image_path)
         )
@@ -184,22 +294,37 @@ class ReplyService:
             sent=False,
             regenerated=True,
             chat_name=message.chat_name,
+            chat_id=message.chat_id,
+            message_id=message.message_id,
             input_content=message.content,
         )
 
-    def send_reply(self, reply: str) -> None:
+    def _request_for(self, message_id: str | None = None):
+        requests = getattr(self, "_requests", {})
+        lock = getattr(self, "_state_lock", None)
+        if lock is None:
+            if message_id:
+                return requests.get(message_id)
+            return getattr(self, "_last_request", None)
+        with lock:
+            if message_id:
+                return requests.get(message_id)
+            return getattr(self, "_last_request", None)
+
+    def send_reply(self, reply: str, message_id: str | None = None) -> None:
         """手动发送界面中当前的预览回复。
 
         该操作是用户明确点击后的一次性发送，因此即使服务处于“仅预览”模式也允许。
         """
-        if self._last_request is None:
+        request = self._request_for(message_id)
+        if request is None:
             raise RuntimeError("还没有可发送的回复")
         text = reply.strip()
         if not text:
             raise RuntimeError("回复内容为空")
-        message = self._last_request[0]
+        message = request[0]
         self._emit("sending", reply=text, manual=True)
-        self.adapter.send_text(text)
+        self._send_message(message, text)
         # 写入本地状态以保持回复冷却逻辑一致；微信记忆层仍会过滤 AI 回复。
         self.storage.add_message(message.chat_id, "assistant", text)
         logger.info("已手动发送回复：%s", text)
@@ -209,14 +334,20 @@ class ReplyService:
             sent=True,
             manual=True,
             chat_name=message.chat_name,
+            chat_id=message.chat_id,
+            message_id=getattr(message, "message_id", ""),
             input_content=message.content,
         )
 
     def run(self) -> None:
         self._maybe_cleanup_media(force=True)
         # 监听前即预加载，保证启动后第一次回复就有聊天记忆。
-        self._refresh_history()
-        self.worker.start()
+        # 每个目标会话使用独立上下文和回复队列；不同联系人可以并行生成回复，
+        # 同一联系人仍按消息到达顺序串行处理。
+        for chat_id in self.worker_queues:
+            self._refresh_history(chat_id=chat_id)
+        for worker in self.workers.values():
+            worker.start()
         self.adapter.listen(self.enqueue)
         logger.info("服务已启动。dry-run=%s，按 Ctrl+C 停止。", self.dry_run)
         self._emit("service_started", dry_run=self.dry_run)
@@ -233,8 +364,15 @@ class ReplyService:
             self._stopped = True
             self.stop_event.set()
             self.adapter.stop()
-            if self.worker.is_alive() and threading.current_thread() is not self.worker:
-                self.worker.join(timeout=3)
+            for work_queue in getattr(self, "worker_queues", {}).values():
+                work_queue.put(_WORKER_STOP)
+            for worker in getattr(self, "workers", {}).values():
+                if worker.is_alive() and threading.current_thread() is not worker:
+                    worker.join(timeout=3)
+            worker = getattr(self, "worker", None)
+            if worker is not None and worker not in getattr(self, "workers", {}).values():
+                if worker.is_alive() and threading.current_thread() is not worker:
+                    worker.join(timeout=3)
             logger.info("服务已停止")
             self._emit("service_stopped")
 
@@ -245,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="覆盖配置，只生成不发送")
     parser.add_argument("--headless", action="store_true", help="不打开界面，按配置运行监听服务")
     parser.add_argument("--gui", action="store_true", help="强制打开桌面控制台")
-    parser.add_argument("--check", action="store_true", help="检查配置和 OpenAI SDK，不连接微信")
+    parser.add_argument("--check", action="store_true", help="检查配置和模型 SDK，不连接微信")
     parser.add_argument(
         "--test-send",
         metavar="TEXT",
@@ -254,7 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-reply",
         metavar="TEXT",
-        help="诊断打包版 Codex 生成和微信发送完整链路",
+        help="诊断打包版模型生成和微信发送完整链路",
     )
     return parser.parse_args()
 
@@ -321,11 +459,11 @@ def main() -> None:
 
     if args.test_reply is not None:
         generator = ReplyGenerator(settings)
-        logger.info("开始执行打包版 Codex 生成诊断")
+        logger.info("开始执行打包版模型生成诊断")
         reply = add_ai_prefix(generator.generate([], args.test_reply))
         adapter = WeChatAdapter(settings)
         adapter.send_text(reply)
-        logger.info("打包版 Codex 生成和微信发送诊断通过：%s", reply)
+        logger.info("打包版模型生成和微信发送诊断通过：%s", reply)
         return
 
     if args.send and args.dry_run:

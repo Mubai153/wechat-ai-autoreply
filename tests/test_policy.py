@@ -62,9 +62,39 @@ def test_ai_prefix_is_added_once():
 
 
 def test_outgoing_messages_are_detected():
-    assert _is_outgoing({"origin_source": 1})
     assert _is_outgoing({"is_self": True})
+    assert _is_outgoing({"sender_id": 2, "origin_source": 2})
+    # origin_source 是来源渠道，不代表消息方向。
+    assert not _is_outgoing({"sender_id": 4, "origin_source": 1})
+    # 没有 sender_id 的旧格式仍兼容 origin_source。
+    assert _is_outgoing({"origin_source": 1})
     assert not _is_outgoing({"origin_source": 2})
+
+
+def test_listener_drops_self_sender_messages():
+    callbacks = {}
+
+    class FakeListener:
+        def add_listener(self, user, callback):
+            callbacks[user] = callback
+
+        def start(self):
+            return None
+
+    adapter = WeChatAdapter.__new__(WeChatAdapter)
+    adapter.listener = FakeListener()
+    adapter.target_usernames = {"小明": "wxid_xiaoming"}
+    adapter.target_username = "wxid_xiaoming"
+    adapter.settings = settings(Path("."))
+    adapter._self_ids = set()
+    received = []
+
+    adapter.listen(received.append)
+    callback = callbacks["wxid_xiaoming"]
+    callback({"sender_id": 2, "origin_source": 2, "content": "我发的"}, None)
+    callback({"sender_id": 4, "origin_source": 1, "content": "对方发的"}, None)
+
+    assert [item.content for item in received] == ["对方发的"]
 
 
 def test_non_text_message_is_skipped(tmp_path: Path):

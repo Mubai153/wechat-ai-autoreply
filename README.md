@@ -1,15 +1,16 @@
 # 微信 AI 自动回复
 
-一个运行在 Windows 本机的微信 4.x AI 自动回复工具。它可以监听一个指定联系人，读取最近的真实聊天记录作为上下文，调用 Codex CLI 或 OpenAI 兼容接口生成回复，并提供“仅预览”和“自动发送”两种模式。
+一个运行在 Windows 本机的微信 4.x AI 自动回复工具。它可以同时监听最多三个指定联系人，分别读取各自最近的真实聊天记录作为上下文，通过 CC Switch 当前选中的 API 生成回复，并提供“仅预览”和“自动发送”两种模式。
 
 > [!WARNING]
 > 本项目不是微信官方接口，而是通过第三方适配器读取本机微信数据，并通过 Windows UIAutomation（UIA）操作微信。使用前请审查项目及第三方依赖源码，先用测试账号和“仅预览”模式验证。使用者需自行承担账号限制、误回复和隐私泄露等风险。
 
 ## 功能特性
 
-- 只监听一个指定联系人，避免误处理其他会话
-- 默认通过本机已登录的 Codex CLI 生成回复，无需在项目中保存 OpenAI API Key
-- 可切换到支持 `/v1/chat/completions` 的 OpenAI 兼容接口
+- 最多同时监听三个指定联系人，避免误处理其他会话
+- 默认直连 CC Switch 本地路由，不在项目中保存上游 API Key
+- 在 CC Switch 的 Codex 页切换供应商后，下一条回复自动使用对应 API 和模型，无需重启本程序
+- 仍可选用 Codex CLI、LM Studio 本地模型或支持 `/v1/chat/completions` 的 OpenAI 兼容接口
 - 启动时及每次回复前读取真实双方聊天记录，并过滤程序自己的 `AI：` 回复
 - 默认使用不移动鼠标的 UIAutomation 后台发送方式
 - 提供桌面控制台、纯命令行模式和 Windows 可执行程序打包脚本
@@ -20,7 +21,7 @@
 
 - 仅支持 **Windows** 和 **微信桌面版 4.x**，不能部署到 Linux 服务器、Docker 或没有登录微信的云主机。
 - 微信和本程序必须运行在同一台电脑、同一个 Windows 用户会话中；锁屏、退出微信或微信升级都可能影响监听和发送。
-- 当前一次只能配置一个目标联系人，建议给该联系人设置唯一备注名。
+- 当前最多可配置三个目标联系人，建议给每个联系人设置唯一备注名；多个备注名用逗号分隔。
 - 文本消息可直接处理；普通图片需显式开启图片识别；动画表情和其他非文本消息会跳过。
 - 自动回复统一带有 `AI：` 前缀，用于向对方说明消息来源并防止程序回复自己。
 - 项目依赖非官方微信适配器，微信版本变化后可能需要等待适配器更新。
@@ -35,7 +36,7 @@
 | 微信 | 微信桌面版 4.x，并已登录 |
 | Python | [Python 3.10 或更高版本](https://www.python.org/downloads/windows/)，建议 3.12；安装时勾选“Add Python to PATH” |
 | Git | [Git for Windows](https://git-scm.com/download/win)，用于下载项目和第三方适配器 |
-| 模型服务 | Codex CLI 登录态，或一个 OpenAI 兼容接口 |
+| 模型服务 | 推荐安装并配置 [CC Switch](https://github.com/farion1231/cc-switch)；也可使用 Codex CLI、LM Studio 或 OpenAI 兼容接口 |
 
 可以在 PowerShell 中检查环境：
 
@@ -44,7 +45,9 @@ python --version
 git --version
 ```
 
-如果使用 Codex CLI，请按 [Codex CLI 官方文档](https://learn.chatgpt.com/docs/codex/cli) 完成安装，并运行一次 `codex`，选择使用 ChatGPT 登录。然后检查：
+默认的 CC Switch 模式需要先打开 CC Switch，在“设置 → 路由 → 本地路由”中开启总开关和 **Codex** 路由，并在 Codex 页选择一个供应商。默认监听地址为 `http://127.0.0.1:15721`。如果选择 `OpenAI Official`，还需要按 [Codex CLI 官方文档](https://learn.chatgpt.com/docs/codex/cli) 完成一次 ChatGPT 登录。
+
+可以用以下命令检查 Codex 登录（仅 OpenAI Official 需要）：
 
 ```powershell
 codex --version
@@ -100,9 +103,27 @@ notepad .env
 
 ## 配置模型
 
-在以下两种方式中选择一种。默认推荐 Codex CLI。
+在以下三种方式中选择一种。默认推荐 CC Switch。
 
-### 方式 A：Codex CLI
+### 方式 A：CC Switch（默认）
+
+先在 CC Switch 中开启本地路由和 Codex 路由，再在 `.env` 中填写：
+
+```dotenv
+LLM_PROVIDER=ccswitch
+CCSWITCH_BASE_URL=http://127.0.0.1:15721/v1
+CCSWITCH_MODEL=
+WECHAT_TARGETS=联系人A,联系人B,联系人C
+# 旧版单联系人配置仍兼容；WECHAT_TARGETS 有值时优先使用它。
+WECHAT_TARGET=联系人A
+AUTO_SEND=false
+```
+
+`CCSWITCH_MODEL` 建议留空。程序会在每次生成前读取 CC Switch 管理的 `~/.codex/config.toml`，自动取得当前模型；因此在 CC Switch 的 **Codex** 页切换 API/供应商后，下一条微信回复就会使用新的供应商。上游 API Key 仍只保存在 CC Switch 中，项目只向本机路由发送请求。
+
+如果 CC Switch 使用了自定义端口，再同步修改 `CCSWITCH_BASE_URL`。当前模式调用 Responses API，并由 CC Switch 自动转换到供应商实际使用的 Responses、Chat Completions 或 Anthropic 协议。
+
+### 方式 B：Codex CLI
 
 确保已经完成上面的 Codex CLI 登录，然后在 `.env` 中至少填写：
 
@@ -110,7 +131,7 @@ notepad .env
 LLM_PROVIDER=codex_cli
 CODEX_COMMAND=codex
 CODEX_MODEL=
-WECHAT_TARGET=对方在微信中的唯一备注名
+WECHAT_TARGETS=联系人A,联系人B,联系人C
 AUTO_SEND=false
 ```
 
@@ -118,7 +139,22 @@ AUTO_SEND=false
 
 如果 `codex` 没有加入 PATH，也可以把 `CODEX_COMMAND` 改成 `codex.exe` 的绝对路径。
 
-### 方式 B：OpenAI 兼容接口
+### 方式 C：LM Studio 本地模型
+
+先在 [LM Studio](https://lmstudio.ai/) 中下载并加载模型，然后打开本地服务器（Developer → Start Server）。LM Studio 默认提供 OpenAI 兼容接口 `http://127.0.0.1:1234/v1`。
+
+在 `.env` 中填写：
+
+```dotenv
+LLM_PROVIDER=lmstudio
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
+LMSTUDIO_MODEL=
+LMSTUDIO_API_KEY=lm-studio
+```
+
+`LMSTUDIO_MODEL` 可以填写 LM Studio 页面或 `/v1/models` 返回的模型 ID；留空时程序会在第一次生成回复前自动选择返回列表中的第一个模型。LM Studio 必须保持服务器已启动并且已经加载模型。程序对 LM Studio 请求关闭隐藏思考，以避免 Qwen 推理模型耗尽回复字数上限；图片理解还需要加载支持视觉输入的模型。
+
+### 方式 D：OpenAI 兼容接口
 
 接口必须兼容 OpenAI Chat Completions。`LLM_BASE_URL` 填写到 API 版本层（通常以 `/v1` 结尾），不要填写完整的 `/chat/completions` 路径：
 
@@ -127,7 +163,7 @@ LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://example.com/v1
 LLM_API_KEY=替换为你的密钥
 LLM_MODEL=替换为服务商提供的模型名
-WECHAT_TARGET=对方在微信中的唯一备注名
+WECHAT_TARGETS=联系人A,联系人B,联系人C
 AUTO_SEND=false
 ```
 
@@ -141,7 +177,7 @@ AUTO_SEND=false
 > “仅生成预览”只表示不会自动发送；点击界面的手动发送按钮仍会真实发出消息。程序仍会读取最近聊天记录并传给你选择的模型服务，默认最多读取 100 条。测试前请确认联系人和聊天内容适合交给该服务，必要时使用测试账号或减小 `MAX_HISTORY_MESSAGES`。
 
 1. 启动微信桌面端并确认目标联系人可以正常收发消息。
-2. 检查必填配置，并确认 Codex 命令可被找到或兼容接口客户端可初始化：
+2. 检查必填配置，并确认所选模型客户端可以初始化：
 
    ```powershell
    .\.venv\Scripts\python.exe main.py --check
@@ -161,7 +197,7 @@ AUTO_SEND=false
 
 监听器启动时会把当前最新消息作为起点，只处理之后收到的新消息，不会自动回复启动前的历史消息。历史消息只会作为模型上下文使用。
 
-GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击“开始监听”才会运行。界面上的模式切换只影响当前运行；若要改变下次启动的默认值，请在设置页修改并保存 `AUTO_SEND`。命令行参数会覆盖本次运行的发送模式，但不会修改 `.env`。
+GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击“开始监听”才会运行。设置页中的修改（包括“回复指令”）会立即安全写入程序旁边的 `.env`，下次启动会从该文件恢复；界面上的模式切换只影响当前运行，若要改变下次启动的默认值，请在设置页修改并保存 `AUTO_SEND`。命令行参数会覆盖本次运行的发送模式，但不会修改 `.env`。
 
 ## 日常使用
 
@@ -194,24 +230,29 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 - `dist\微信自动回复\微信自动回复.exe`
 - 项目根目录下的 `启动微信自动回复.lnk`
 
-双击快捷方式或 EXE 即可打开桌面控制台。微信和 Codex CLI（如果使用）仍需在运行该程序的电脑上安装并保持登录。
+双击快捷方式或 EXE 即可打开桌面控制台。微信和 CC Switch（默认模式）需在运行该程序的电脑上保持运行；使用 OpenAI Official 时 Codex 登录也必须有效。
 
 > [!IMPORTANT]
-> 打包脚本会把当前 `.env` 和现有 `data/` 复制到应用目录，其中可能包含 API Key、联系人信息、聊天状态和图片缓存。不要直接把自己构建的 `dist/` 发给他人。让其他使用者从源码自行配置和构建，或在分发前彻底检查并移除个人数据。
+> 打包脚本会把当前 `.env` 和现有 `data/` 复制到应用目录，其中可能包含 API Key、联系人信息、聊天状态和图片缓存。应用目录中已有的 `.env` 会在重新打包时保留，避免覆盖 GUI 中已保存的回复指令。不要直接把自己构建的 `dist/` 发给他人。让其他使用者从源码自行配置和构建，或在分发前彻底检查并移除个人数据。
 
 打包版日志位于 `dist\微信自动回复\logs\wechat_autoreply.log`；源码运行时日志位于项目根目录的 `logs\wechat_autoreply.log`。日志最大 2 MB，并保留 3 份轮转备份。
 
 ## 配置项说明
 
-所有配置都写在项目根目录的 `.env` 中。
+源码运行时配置写在项目根目录的 `.env` 中；打包运行时配置写在 EXE 旁边的 `.env` 中。
 
 ### 模型配置
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `LLM_PROVIDER` | `codex_cli` | `codex_cli` 或 `openai_compatible` |
+| `LLM_PROVIDER` | `ccswitch` | `ccswitch`、`codex_cli`、`lmstudio` 或 `openai_compatible` |
+| `CCSWITCH_BASE_URL` | `http://127.0.0.1:15721/v1` | CC Switch 的 Codex 本地路由地址 |
+| `CCSWITCH_MODEL` | 空 | 留空时每次请求自动读取 CC Switch 当前模型；填写后固定模型 |
 | `CODEX_COMMAND` | `codex` | Codex CLI 命令名或可执行文件绝对路径 |
 | `CODEX_MODEL` | 空 | Codex 模型；留空使用 Codex 当前默认模型 |
+| `LMSTUDIO_BASE_URL` | `http://127.0.0.1:1234/v1` | LM Studio 本地服务器地址 |
+| `LMSTUDIO_MODEL` | 空 | LM Studio 模型 ID；留空自动选择 `/v1/models` 返回的第一个模型 |
+| `LMSTUDIO_API_KEY` | `lm-studio` | LM Studio 通常不校验，仅用于满足 OpenAI SDK 的客户端参数要求 |
 | `CODEX_TIMEOUT_SECONDS` | `120` | 单次 Codex 调用超时，最小 10 秒 |
 | `LLM_BASE_URL` | 空 | OpenAI 兼容接口根地址，仅兼容接口模式必填 |
 | `LLM_API_KEY` | 空 | 兼容接口密钥，仅兼容接口模式必填 |
@@ -221,7 +262,8 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WECHAT_TARGET` | 空 | 目标联系人的唯一备注名或名称，必填 |
+| `WECHAT_TARGETS` | 空 | 最多 3 个目标联系人的备注名或名称，用逗号、分号或换行分隔；必填 |
+| `WECHAT_TARGET` | 空 | 旧版单联系人配置，`WECHAT_TARGETS` 为空时使用 |
 | `AUTO_SEND` | `false` | 下次启动默认是否自动发送；建议保持关闭 |
 | `WECHAT_BACKGROUND_MODE` | `true` | 使用 UIAutomation 后台发送，不移动鼠标 |
 | `WECHAT_ALLOW_MOUSE_FALLBACK` | `false` | UIA 失败时是否允许回退到坐标/OCR 发送；回退可能移动鼠标 |
@@ -262,6 +304,20 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 
 ## 常见问题
 
+### CC Switch 调用失败
+
+- 确认 CC Switch 正在运行，并在“设置 → 路由 → 本地路由”中同时开启总开关和 Codex 路由。
+- 确认 `CCSWITCH_BASE_URL` 与 CC Switch 显示的本地地址一致，默认是 `http://127.0.0.1:15721/v1`。
+- 必须在 CC Switch 的 **Codex** 页切换供应商；Claude Code 或 Gemini 页的选择不会影响本项目。
+- 若当前供应商是 `OpenAI Official`，请重新完成 Codex 登录；第三方供应商的 Key 则在 CC Switch 中检查。
+- 若不同供应商使用不同模型名，保持 `CCSWITCH_MODEL` 为空，让程序跟随 CC Switch 写入的当前模型。
+
+### LM Studio 调用失败
+
+- 确认已在 LM Studio 的 Developer 页面点击 **Start Server**，并且至少加载了一个模型。
+- 在浏览器或 PowerShell 中检查 `http://127.0.0.1:1234/v1/models`；如果修改过端口，同步修改 `LMSTUDIO_BASE_URL`。
+- 如果自动选择的模型不对，请把 `LMSTUDIO_MODEL` 填成 `/v1/models` 返回的准确 `id`。
+
 ### 提示“找不到 Codex CLI”
 
 先运行 `codex --version`。如果 PowerShell 也找不到命令，请重新安装 Codex CLI 或将其加入 PATH；也可以在 `.env` 中把 `CODEX_COMMAND` 设置为 `codex.exe` 的绝对路径。
@@ -278,7 +334,7 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 
 ### 提示“找不到联系人”或“联系人匹配不唯一”
 
-将 `WECHAT_TARGET` 改成微信中显示的精确且唯一的备注名。存在同名联系人时，先在微信里设置不同备注，再重启程序。
+将 `WECHAT_TARGETS` 改成微信中显示的精确且唯一的备注名，多个联系人用逗号分隔。存在同名联系人时，先在微信里设置不同备注，再重启程序。
 
 ### 能生成回复，但没有发送
 
@@ -313,7 +369,7 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 main.py                               程序入口和回复服务
 gui.py                                Windows 桌面控制台
 config.py                             .env 配置读取与校验
-llm.py                                Codex CLI 和兼容接口调用
+llm.py                                CC Switch、Codex CLI 和兼容接口调用
 policy.py                             白名单、消息类型、长度和冷却策略
 storage.py                            SQLite 去重和回复状态
 image_recognition.py                  图片识别相关逻辑

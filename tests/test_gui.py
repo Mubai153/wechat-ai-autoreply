@@ -1,7 +1,9 @@
 import threading
 from types import SimpleNamespace
 
-from gui import directory_size, format_bytes
+import pytest
+
+from gui import AutoReplyApp, directory_size, format_bytes, normalize_numeric_setting
 from main import ReplyService
 
 
@@ -16,6 +18,53 @@ def test_directory_size_counts_nested_files(tmp_path):
     (tmp_path / "a.bin").write_bytes(b"123")
     (tmp_path / "nested" / "b.bin").write_bytes(b"4567")
     assert directory_size(tmp_path) == 7
+
+
+def test_empty_optional_numeric_setting_uses_default():
+    assert normalize_numeric_setting("图片保留天数", "MEDIA_RETENTION_DAYS", "") == "7"
+
+
+def test_numeric_setting_error_identifies_the_field():
+    with pytest.raises(ValueError, match="调用超时（秒）.*CODEX_TIMEOUT_SECONDS"):
+        normalize_numeric_setting("调用超时（秒）", "CODEX_TIMEOUT_SECONDS", "不是数字")
+
+
+def test_send_button_allows_unsent_preview_even_in_auto_mode():
+    configured = {}
+
+    class Button:
+        def configure(self, **kwargs):
+            configured.update(kwargs)
+
+    app = AutoReplyApp.__new__(AutoReplyApp)
+    app.send_reply_button = Button()
+    app.last_reply = "AI：测试"
+    app.last_reply_sent = False
+    app.service = object()
+
+    app._update_send_reply_button()
+
+    assert configured["state"] == "normal"
+    assert configured["cursor"] == "hand2"
+
+
+def test_send_button_stays_disabled_after_reply_was_sent():
+    configured = {}
+
+    class Button:
+        def configure(self, **kwargs):
+            configured.update(kwargs)
+
+    app = AutoReplyApp.__new__(AutoReplyApp)
+    app.send_reply_button = Button()
+    app.last_reply = "AI：测试"
+    app.last_reply_sent = True
+    app.service = object()
+
+    app._update_send_reply_button()
+
+    assert configured["state"] == "disabled"
+    assert configured["cursor"] == "arrow"
 
 
 def test_service_mode_change_emits_structured_event():

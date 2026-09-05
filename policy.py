@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from config import Settings
@@ -7,14 +8,15 @@ from models import IncomingMessage
 from storage import Storage
 
 
-def is_target(message: IncomingMessage, target: str) -> bool:
-    wanted = target.strip().casefold()
-    return wanted in {
+def is_target(message: IncomingMessage, target: str | Iterable[str]) -> bool:
+    targets = (target,) if isinstance(target, str) else target
+    wanted = {item.strip().casefold() for item in targets if item.strip()}
+    return bool(wanted & {
         message.chat_id.strip().casefold(),
         message.chat_name.strip().casefold(),
         message.sender_id.strip().casefold(),
         message.sender_name.strip().casefold(),
-    }
+    })
 
 
 def should_reply(

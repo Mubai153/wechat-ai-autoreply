@@ -7,6 +7,15 @@ $distRoot = Join-Path $root "dist"
 $appDir = Join-Path $distRoot "微信自动回复"
 $exe = Join-Path $appDir "微信自动回复.exe"
 
+# A user may have changed settings from the packaged GUI. Keep that copy while
+# rebuilding; otherwise the next build would silently restore the old prompt
+# from the source checkout.
+$packagedEnvPath = Join-Path $appDir ".env"
+$packagedEnvContent = $null
+if (Test-Path -LiteralPath $packagedEnvPath) {
+    $packagedEnvContent = [System.IO.File]::ReadAllText($packagedEnvPath, [System.Text.Encoding]::UTF8)
+}
+
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Python environment not found: $python"
 }
@@ -17,7 +26,11 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exe)) {
 }
 
 # The user's settings and local conversation database stay outside the bundle.
-Copy-Item -LiteralPath (Join-Path $root ".env") -Destination (Join-Path $appDir ".env") -Force
+if ($null -ne $packagedEnvContent) {
+    [System.IO.File]::WriteAllText($packagedEnvPath, $packagedEnvContent, [System.Text.UTF8Encoding]::new($false))
+} else {
+    Copy-Item -LiteralPath (Join-Path $root ".env") -Destination $packagedEnvPath -Force
+}
 if (Test-Path -LiteralPath (Join-Path $root "data")) {
     Copy-Item -LiteralPath (Join-Path $root "data") -Destination $appDir -Recurse -Force
 }

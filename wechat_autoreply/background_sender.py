@@ -5,7 +5,7 @@ wechatauto 的兼容发送入口为了覆盖更多版本，会在输入时调用
 当前可用的 UIA 控件路径：
 
 * 输入框使用 ``ValuePattern.SetValue``，不调用 ``Click`` 或剪贴板粘贴；
-* 搜索结果使用 ``InvokePattern``/``SelectionItemPattern``，不模拟鼠标；
+* 使用唯一备注名搜索并通过 UIA 默认动作打开结果，不模拟鼠标；
 * 复用一个 UIA 引擎实例，不为每条消息重新初始化 GUI；
 * 操作前后尽量恢复用户原来的前台窗口，避免回复过程打断正在使用的应用。
 
@@ -16,7 +16,7 @@ wechatauto 的兼容发送入口为了覆盖更多版本，会在输入时调用
 from __future__ import annotations
 
 import time
-from typing import Any, Iterable
+from typing import Any
 
 
 class BackgroundSendError(RuntimeError):
@@ -141,16 +141,19 @@ class BackgroundWeChatSender:
     @staticmethod
     def _invoke(control: Any) -> None:
         """以 UIA pattern 触发控件，不使用 Control.Click。"""
-        for getter in ("GetInvokePattern", "GetSelectionItemPattern", "GetLegacyIAccessiblePattern"):
+        # 微信 4.x 的搜索结果会出现 Invoke()/Select() 返回 True、实际却不切换
+        # 会话的情况；LegacyIAccessible.DoDefaultAction() 才会稳定打开条目。
+        actions = (
+            ("GetLegacyIAccessiblePattern", "DoDefaultAction"),
+            ("GetSelectionItemPattern", "Select"),
+            ("GetInvokePattern", "Invoke"),
+        )
+        for getter, action in actions:
             try:
                 pattern = getattr(control, getter)()
                 if pattern is None:
                     continue
-                method = (
-                    getattr(pattern, "Invoke", None)
-                    or getattr(pattern, "Select", None)
-                    or getattr(pattern, "DoDefaultAction", None)
-                )
+                method = getattr(pattern, action, None)
                 if method is not None and method():
                     return
             except Exception:
@@ -170,30 +173,34 @@ class BackgroundWeChatSender:
         if box is None:
             raise BackgroundSendError("微信 UIA 搜索框不可用")
 
-        keywords: Iterable[str]
-        try:
-            keywords = self._uia._resolve_search_keyword(keyword)
-        except Exception:
-            keywords = (keyword,)
-        for candidate in keywords:
-            # 切换候选词前先清空，确保微信刷新 search_list；ValuePattern 本身
-            # 不移动鼠标，清空也能避免上一次无结果查询留下的旧列表。
-            self._set_value(box, "")
-            time.sleep(0.2)
-            self._set_value(box, candidate)
-            time.sleep(1.0)
-            cell = self._find_search_result(candidate)
+        # 调用方传入配置里的唯一备注名。微信搜索框不支持内部 wxid，且在这里
+        # 再做模糊数据库映射可能选到同名联系人，因此只搜索这个备注名。
+        for candidate in (keyword,):
+            cell = None
+            for _attempt in range(3):
+                # 先清空并等待旧 search_list 消失。微信偶尔会忽略紧接着写入
+                # 的同一关键词，因此允许重试，不改用 wxid 或模糊候选词。
+                self._set_value(box, "")
+                time.sleep(0.5)
+                self._set_value(box, candidate)
+                time.sleep(1.0)
+                cell = self._find_search_result(candidate)
+                if cell is not None:
+                    break
             if cell is None:
                 continue
             self._invoke(cell)
-            time.sleep(0.6)
-            current = self._uia.current_chat()
-            if current and (current == candidate or current == keyword):
-                # current_chat 返回昵称/备注，而 target 是 wxid；用稳定的
-                # target 标记会话已打开，后续回复不再重复搜索。
-                self._current_chat = self.target
-                self._opened_chat_name = current
-                return True
+            # 会话标题更新晚于 UIA 动作返回，轮询确认，避免固定 0.6 秒在
+            # 机器繁忙时过早判定失败。
+            deadline = time.monotonic() + min(2.0, self._timeout)
+            while time.monotonic() < deadline:
+                current = self._uia.current_chat()
+                if current and (current == candidate or current == keyword):
+                    # 用配置中的备注名标记会话已打开，后续回复不再重复搜索。
+                    self._current_chat = self.target
+                    self._opened_chat_name = current
+                    return True
+                time.sleep(0.1)
 
         # 清理搜索框，避免下次打开时残留关键词。
         try:

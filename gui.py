@@ -12,9 +12,7 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from dotenv import load_dotenv, set_key
-
-from config import PROJECT_DIR, Settings
+from config import ENV_PATH, PROJECT_DIR, Settings, load_project_env, save_project_env
 from media_cleanup import cleanup_media_cache
 
 
@@ -38,6 +36,31 @@ COLORS = {
 
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
+
+NUMERIC_DEFAULTS = {
+    "REPLY_COOLDOWN_SECONDS": 0,
+    "MAX_HISTORY_MESSAGES": 100,
+    "MAX_REPLY_CHARS": 500,
+    "MAX_INPUT_CHARS": 4000,
+    "CODEX_TIMEOUT_SECONDS": 120,
+    "MEDIA_RETENTION_DAYS": 7,
+    "MEDIA_CACHE_MAX_MB": 512,
+    "MEDIA_CLEANUP_INTERVAL_SECONDS": 3600,
+}
+
+
+def normalize_numeric_setting(label: str, env_key: str, value: str) -> str:
+    """Validate a numeric form value and fill omitted optional defaults."""
+    cleaned = value.strip()
+    if not cleaned:
+        cleaned = str(NUMERIC_DEFAULTS.get(env_key, 0))
+    try:
+        number = int(cleaned, 10)
+    except ValueError as exc:
+        raise ValueError(f"{label}（{env_key}）必须是整数，当前为“{value}”") from exc
+    if number < 0:
+        raise ValueError(f"{label}（{env_key}）不能小于 0")
+    return str(number)
 
 
 def format_bytes(size: int) -> str:
@@ -243,6 +266,8 @@ class AutoReplyApp:
         self.mode_auto = tk.BooleanVar(value=False)
         self.selected_page = "dashboard"
         self.last_reply = ""
+        self.last_reply_sent = False
+        self.last_message_id: str | None = None
         self.activities: deque[tuple[str, str, str]] = deque(maxlen=4)
         self.all_logs: deque[tuple[str, str]] = deque(maxlen=2000)
         self.log_filter = "all"
@@ -395,7 +420,8 @@ class AutoReplyApp:
         self.service_title = tk.Label(left, text="等待启动", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 20, "bold"), anchor="w")
         self.service_title.pack(anchor="w")
         settings = Settings.from_env()
-        self.target_label = tk.Label(left, text=f"目标联系人：{settings.wechat_target or '尚未配置'}", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 9), anchor="w")
+        target_text = "、".join(settings.target_contacts) or "尚未配置"
+        self.target_label = tk.Label(left, text=f"目标联系人：{target_text}", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 9), anchor="w")
         self.target_label.pack(anchor="w", pady=(6, 0))
 
         mode = tk.Frame(status, bg=COLORS["panel"])
@@ -448,11 +474,11 @@ class AutoReplyApp:
         self.reply_text.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 6))
         reply_actions = tk.Frame(self.reply_box, bg=COLORS["green_pale"])
         reply_actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        self.reply_meta = tk.Label(reply_actions, text="Codex  ·  等待消息", bg=COLORS["green_pale"], fg=COLORS["muted"], font=(MONO, 8))
+        self.reply_meta = tk.Label(reply_actions, text="AI  ·  等待消息", bg=COLORS["green_pale"], fg=COLORS["muted"], font=(MONO, 8))
         self.reply_meta.pack(side="left")
         self.send_reply_button = self._button(reply_actions, "发送回复", self._send_reply, primary=True)
         self.send_reply_button.pack(side="right", padx=(8, 0))
-        self.send_reply_button.configure(state="disabled")
+        self._update_send_reply_button()
         self._button(reply_actions, "重新生成", self._regenerate).pack(side="right", padx=(8, 0))
         self._button(reply_actions, "复制回复", self._copy_reply).pack(side="right")
 
@@ -462,7 +488,7 @@ class AutoReplyApp:
         tk.Label(runtime_head, text="运行状态", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").pack(side="left")
         self._link_button(runtime_head, "调整设置  →", lambda: self._show_page("ai")).pack(side="right")
         self.runtime_values: dict[str, tk.Label] = {}
-        for name in ("微信连接", "Codex 登录", "后台发送"):
+        for name in ("微信连接", "模型服务", "后台发送"):
             row = tk.Frame(runtime, bg=COLORS["panel"])
             row.pack(fill="x", padx=22, pady=5)
             tk.Label(row, text="●", bg=COLORS["panel"], fg="#B7C1BC", font=(FONT, 9)).pack(side="left")
@@ -516,18 +542,23 @@ class AutoReplyApp:
                 ),
             ),
             "contact": lambda: self._create_form_page(
-                "contact", "联系人与语气", "指定唯一联系人，并可加载离线语气画像。",
+                "contact", "联系人与语气", "最多监听 3 个联系人；用逗号分隔备注名，并可加载离线语气画像。",
                 (
-                    ("目标联系人", "WECHAT_TARGET", "entry", "填写微信中的唯一备注名"),
+                    ("目标联系人（最多 3 个）", "WECHAT_TARGETS", "entry", "填写备注名，多个联系人用逗号分隔"),
                     ("语气画像文件", "PERSONA_PATH", "file", "可选的 persona.json 文件"),
                 ),
             ),
             "ai": lambda: self._create_form_page(
                 "ai", "AI 与图片", "配置生成模型、图片理解和缓存保留策略。",
                 (
-                    ("模型来源", "LLM_PROVIDER", "choice:codex_cli|openai_compatible", "推荐使用本机已登录的 Codex CLI"),
+                    ("模型来源", "LLM_PROVIDER", "choice:ccswitch|codex_cli|lmstudio|openai_compatible", "可选择 CC Switch、Codex CLI、LM Studio 本地模型或其他兼容接口"),
+                    ("CC Switch 地址", "CCSWITCH_BASE_URL", "entry", "默认 http://127.0.0.1:15721/v1"),
+                    ("CC Switch 模型", "CCSWITCH_MODEL", "entry", "留空时自动读取 CC Switch 当前模型"),
                     ("Codex 命令", "CODEX_COMMAND", "entry", "通常保持 codex"),
                     ("Codex 模型", "CODEX_MODEL", "entry", "留空时使用 Codex 当前默认模型"),
+                    ("LM Studio 地址", "LMSTUDIO_BASE_URL", "entry", "默认 http://127.0.0.1:1234/v1；需先在 LM Studio 启动本地服务器"),
+                    ("LM Studio 模型", "LMSTUDIO_MODEL", "entry", "填写 LM Studio 的模型 ID；留空时自动使用 /v1/models 返回的第一个模型"),
+                    ("LM Studio Key", "LMSTUDIO_API_KEY", "secret", "LM Studio 通常可填写 lm-studio；仅保存在本机 .env"),
                     ("调用超时（秒）", "CODEX_TIMEOUT_SECONDS", "entry", "建议不少于 120 秒"),
                     ("兼容接口地址", "LLM_BASE_URL", "entry", "仅 openai_compatible 模式需要"),
                     ("兼容接口 Key", "LLM_API_KEY", "secret", "只保存在本机 .env"),
@@ -600,6 +631,14 @@ class AutoReplyApp:
             control = tk.Frame(inner, bg=COLORS["panel"])
             control.grid(row=grid_row, column=1, sticky="nsew", padx=(0, 30), pady=16)
             raw = os.getenv(env_key, "")
+            if env_key == "WECHAT_TARGETS" and not raw.strip():
+                raw = os.getenv("WECHAT_TARGET", "")
+            if env_key == "LMSTUDIO_BASE_URL" and not raw.strip():
+                raw = "http://127.0.0.1:1234/v1"
+            if env_key == "LMSTUDIO_API_KEY" and not raw.strip():
+                raw = "lm-studio"
+            if env_key in NUMERIC_DEFAULTS and not raw.strip():
+                raw = str(NUMERIC_DEFAULTS[env_key])
             if kind == "bool":
                 var = tk.BooleanVar(value=raw.strip().lower() in {"1", "true", "yes", "on"})
                 Toggle(control, var).pack(side="right", padx=8, pady=4)
@@ -685,21 +724,9 @@ class AutoReplyApp:
             variable.set(chosen)
 
     def _save_fields(self, fields: tuple[tuple[str, str, str, str], ...]) -> None:
-        env_path = PROJECT_DIR / ".env"
-        if not env_path.exists():
-            example = PROJECT_DIR / ".env.example"
-            if example.exists():
-                env_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
-            else:
-                env_path.touch()
-        numeric_keys = {
-            "REPLY_COOLDOWN_SECONDS", "MAX_HISTORY_MESSAGES", "MAX_REPLY_CHARS",
-            "MAX_INPUT_CHARS", "CODEX_TIMEOUT_SECONDS", "MEDIA_RETENTION_DAYS",
-            "MEDIA_CACHE_MAX_MB", "MEDIA_CLEANUP_INTERVAL_SECONDS",
-        }
         updates: dict[str, str] = {}
         try:
-            for _label, env_key, _kind, _help in fields:
+            for label, env_key, _kind, _help in fields:
                 widget = self.form_vars[env_key]
                 if isinstance(widget, tk.Text):
                     value = widget.get("1.0", "end-1c").strip()
@@ -707,35 +734,37 @@ class AutoReplyApp:
                     value = "true" if widget.get() else "false"
                 else:
                     value = str(widget.get()).strip()
-                if env_key in numeric_keys:
-                    number = int(value)
-                    if number < 0:
-                        raise ValueError(f"{env_key} 不能小于 0")
+                if env_key in NUMERIC_DEFAULTS:
+                    value = normalize_numeric_setting(label, env_key, value)
                 updates[env_key] = value
         except ValueError as exc:
             messagebox.showerror("无法保存", f"请检查数字配置：{exc}", parent=self.root)
             return
 
-        for env_key, value in updates.items():
-            set_key(str(env_path), env_key, value, quote_mode="auto")
-            os.environ[env_key] = value
-        load_dotenv(env_path, override=True)
+        try:
+            save_project_env(updates)
+        except OSError as exc:
+            messagebox.showerror("无法保存", f"配置文件写入失败：{exc}", parent=self.root)
+            return
         self._sync_settings_summary()
-        self._add_activity("配置已保存，下次启动监听后生效", "info")
-        messagebox.showinfo("已保存", "配置已保存到本机。", parent=self.root)
+        self._add_activity("配置已保存，下次启动仍会保留", "info")
+        messagebox.showinfo("已保存", f"配置已保存到：\n{ENV_PATH}", parent=self.root)
 
     def _sync_settings_summary(self) -> None:
         settings = Settings.from_env()
-        self.target_label.configure(text=f"目标联系人：{settings.wechat_target or '尚未配置'}")
+        target_text = "、".join(settings.target_contacts) or "尚未配置"
+        self.target_label.configure(text=f"目标联系人：{target_text}")
         self.quick_cooldown.configure(text=f"{settings.reply_cooldown_seconds} 秒")
         self.quick_history.configure(text=f"{settings.max_history_messages} 条")
         self.quick_image_var.set(settings.image_recognition_enabled)
 
     def _quick_image_changed(self) -> None:
         value = "true" if self.quick_image_var.get() else "false"
-        env_path = PROJECT_DIR / ".env"
-        set_key(str(env_path), "IMAGE_RECOGNITION_ENABLED", value, quote_mode="auto")
-        os.environ["IMAGE_RECOGNITION_ENABLED"] = value
+        try:
+            save_project_env({"IMAGE_RECOGNITION_ENABLED": value})
+        except OSError as exc:
+            messagebox.showerror("无法保存", f"配置文件写入失败：{exc}", parent=self.root)
+            return
         form = self.form_vars.get("IMAGE_RECOGNITION_ENABLED")
         if isinstance(form, tk.BooleanVar):
             form.set(self.quick_image_var.get())
@@ -770,9 +799,24 @@ class AutoReplyApp:
         self.preview_button.configure(bg=COLORS["soft"] if auto else COLORS["green_soft"], fg=COLORS["muted"] if auto else COLORS["green_dark"])
         self.send_button.configure(bg=COLORS["green_soft"] if auto else COLORS["soft"], fg=COLORS["green_dark"] if auto else COLORS["muted"])
         self.mode_hint.configure(text="回复将自动发送给对方" if auto else "回复不会发给对方", fg=COLORS["danger"] if auto else COLORS["muted"])
-        if hasattr(self, "send_reply_button"):
-            can_send = bool(self.last_reply and self.service is not None and not auto)
-            self.send_reply_button.configure(state="normal" if can_send else "disabled")
+        self._update_send_reply_button()
+
+    def _update_send_reply_button(self) -> None:
+        """只允许发送当前尚未发出的预览回复。
+
+        手动发送是对某一条预览的明确操作，因此不应该再被当前运行模式
+        （自动发送/仅预览）锁死。自动发送成功后 ``last_reply_sent`` 会阻止
+        重复发送；重新生成或切回预览后，新的未发送内容仍然可以手动发送。
+        """
+        if not hasattr(self, "send_reply_button"):
+            return
+        can_send = bool(self.last_reply.strip()) and not self.last_reply_sent and self.service is not None
+        self.send_reply_button.configure(
+            state="normal" if can_send else "disabled",
+            bg=COLORS["ink"] if can_send else COLORS["soft"],
+            fg="#FFFFFF" if can_send else COLORS["muted_2"],
+            cursor="hand2" if can_send else "arrow",
+        )
 
     def _set_mode(self, auto: bool) -> None:
         if auto and not self.mode_auto.get():
@@ -802,11 +846,11 @@ class AutoReplyApp:
         self.start_button.configure(text="取消启动", state="normal")
         self.top_connection.configure(text="●  正在连接", fg=COLORS["warning"])
         self.pipeline.reset()
-        self._add_activity("正在检查微信与 Codex", "info")
+        self._add_activity("正在检查微信与模型服务", "info")
 
         def run() -> None:
             try:
-                load_dotenv(PROJECT_DIR / ".env", override=True)
+                load_project_env()
                 settings = Settings.from_env()
                 settings.validate()
                 if self.service_class is None:
@@ -854,57 +898,74 @@ class AutoReplyApp:
     def _service_event(self, event: str, payload: dict[str, Any]) -> None:
         self.ui_queue.put({"kind": "event", "event": event, "payload": payload})
 
+    def _is_current_message(self, payload: dict[str, Any]) -> bool:
+        """并行处理时只让当前预览对应的消息更新回复面板。"""
+        message_id = payload.get("message_id")
+        return not self.last_message_id or not message_id or message_id == self.last_message_id
+
     def _handle_event(self, event: str, payload: dict[str, Any]) -> None:
         now = datetime.now().strftime("%H:%M:%S")
         if event == "service_started":
             self.service_title.configure(text="正在监听")
             self.start_button.configure(text="停止监听", state="normal")
             self.top_connection.configure(text="●  微信已连接", fg=COLORS["green_dark"])
-            for key, text in (("微信连接", "正常"), ("Codex 登录", "已登录"), ("后台发送", "UIA 可用")):
+            for key, text in (("微信连接", "正常"), ("模型服务", "已就绪"), ("后台发送", "UIA 可用")):
                 self.runtime_values[key].configure(text=text, fg=COLORS["green_dark"])
-            self._add_activity("服务启动，微信与 Codex 检查通过", "success")
+            self._add_activity("服务启动，微信与模型服务检查通过", "success")
         elif event == "received":
+            # 新消息到来时，旧预览不能继续作为可发送内容，避免误发上一条回复。
+            self.last_reply = ""
+            self.last_reply_sent = False
+            self.last_message_id = str(payload.get("message_id", "")) or None
             self.incoming_sender.configure(text=f"{payload.get('chat_name', '目标联系人')}  ·  {now}")
             self.incoming_text.configure(text=payload.get("content", ""))
             self.reply_status.configure(text="正在处理")
             self.reply_text.configure(text="正在检查回复规则…")
-            self.send_reply_button.configure(state="disabled")
+            self._update_send_reply_button()
             self.pipeline.set_stage(0, now, "done")
             self._add_activity(f"收到来自 {payload.get('chat_name', '目标联系人')} 的{payload.get('message_type', '文本')}消息", "success")
         elif event == "policy_passed":
-            self.pipeline.set_stage(1, "已通过", "done")
-            self.reply_text.configure(text="规则已通过，准备生成回复…")
+            if self._is_current_message(payload):
+                self.pipeline.set_stage(1, "已通过", "done")
+                self.reply_text.configure(text="规则已通过，准备生成回复…")
         elif event == "generating":
-            self.pipeline.set_stage(2, "生成中", "active")
-            self.reply_status.configure(text="AI 正在生成")
-            self.reply_text.configure(text="Codex 正在结合聊天上下文生成回复…")
-            self.reply_meta.configure(text=f"Codex  ·  使用 {payload.get('history_count', 0)} 条上下文")
+            if self._is_current_message(payload):
+                self.pipeline.set_stage(2, "生成中", "active")
+                self.reply_status.configure(text="AI 正在生成")
+                self.reply_text.configure(text="AI 正在结合聊天上下文生成回复…")
+                self.reply_meta.configure(text=f"AI  ·  使用 {payload.get('history_count', 0)} 条上下文")
+                self.send_reply_button.configure(state="disabled", bg=COLORS["soft"], fg=COLORS["muted_2"], cursor="arrow")
         elif event == "sending":
-            self.pipeline.set_stage(3, "发送中", "active")
-            self.reply_status.configure(text="正在发送")
+            if self._is_current_message(payload):
+                self.pipeline.set_stage(3, "发送中", "active")
+                self.reply_status.configure(text="正在发送")
         elif event == "generated":
             reply = str(payload.get("reply", ""))
-            self.last_reply = reply
             sent = bool(payload.get("sent"))
             manual = bool(payload.get("manual"))
-            self.reply_text.configure(text=reply)
-            self.reply_status.configure(text=("已发送" if manual else "已自动发送") if sent else "AI 回复预览 · 未发送")
-            self.reply_meta.configure(text=f"Codex  ·  {len(reply)} 字")
-            self.pipeline.set_stage(3, "已发送" if sent else "仅预览", "done" if sent else "idle")
-            self.send_reply_button.configure(state="disabled" if sent or self.mode_auto.get() else "normal")
+            if self._is_current_message(payload):
+                self.last_reply = reply
+                self.last_reply_sent = sent
+                self.last_message_id = str(payload.get("message_id", "")) or self.last_message_id
+                self.reply_text.configure(text=reply)
+                self.reply_status.configure(text=("已发送" if manual else "已自动发送") if sent else "AI 回复预览 · 未发送")
+                self.reply_meta.configure(text=f"AI  ·  {len(reply)} 字")
+                self.pipeline.set_stage(3, "已发送" if sent else "仅预览", "done" if sent else "idle")
+                self._update_send_reply_button()
             self._add_activity(("已手动发送回复" if manual else "已自动发送回复") if sent else "已生成回复，仅预览未发送", "success")
         elif event == "skipped":
             reason = str(payload.get("reason", "不符合回复条件"))
-            self.pipeline.set_stage(1, reason, "idle")
-            self.reply_status.configure(text="已跳过")
-            self.reply_text.configure(text=f"本条消息未回复：{reason}")
+            if self._is_current_message(payload):
+                self.pipeline.set_stage(1, reason, "idle")
+                self.reply_status.configure(text="已跳过")
+                self.reply_text.configure(text=f"本条消息未回复：{reason}")
             self._add_activity(f"已跳过消息：{reason}", "warning")
         elif event in {"error", "service_error"}:
             message = str(payload.get("message", "未知错误"))
-            self.reply_status.configure(text="处理失败", fg=COLORS["danger"])
-            self.reply_text.configure(text=message)
-            if hasattr(self, "send_reply_button") and self.last_reply and not self.mode_auto.get():
-                self.send_reply_button.configure(state="normal")
+            if self._is_current_message(payload):
+                self.reply_status.configure(text="处理失败", fg=COLORS["danger"])
+                self.reply_text.configure(text=message)
+                self._update_send_reply_button()
             self.service_title.configure(text="启动失败" if event == "service_error" else "运行异常")
             self.top_connection.configure(text="●  需要处理", fg=COLORS["danger"])
             self._add_activity(message, "error")
@@ -957,7 +1018,12 @@ class AutoReplyApp:
         for value in self.runtime_values.values():
             value.configure(text="未检查", fg=COLORS["muted"])
         if hasattr(self, "send_reply_button"):
-            self.send_reply_button.configure(state="disabled")
+            self.send_reply_button.configure(
+                state="disabled",
+                bg=COLORS["soft"],
+                fg=COLORS["muted_2"],
+                cursor="arrow",
+            )
 
     def _regenerate(self) -> None:
         service = self.service
@@ -966,7 +1032,7 @@ class AutoReplyApp:
             return
         def run() -> None:
             try:
-                service.regenerate_last()
+                service.regenerate_last(self.last_message_id)
             except Exception as exc:
                 self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
         threading.Thread(target=run, name="gui-regenerate", daemon=True).start()
@@ -979,11 +1045,11 @@ class AutoReplyApp:
         if not self.last_reply:
             messagebox.showinfo("暂无回复", "目前没有可发送的回复。", parent=self.root)
             return
-        self.send_reply_button.configure(state="disabled")
+        self.send_reply_button.configure(state="disabled", bg=COLORS["soft"], fg=COLORS["muted_2"], cursor="arrow")
 
         def run() -> None:
             try:
-                service.send_reply(self.last_reply)
+                service.send_reply(self.last_reply, self.last_message_id)
             except Exception as exc:
                 self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
 
