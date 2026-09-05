@@ -9,7 +9,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
 
-from config import PROJECT_DIR, Settings
+from config import PROJECT_DIR, ReplyProfile, Settings
 from llm import ReplyGenerator
 from media_cleanup import cleanup_media_cache
 from policy import is_target, should_reply
@@ -43,6 +43,9 @@ class ReplyService:
         self.event_callback = event_callback
         self.storage = Storage(settings.database_path)
         self.generator = ReplyGenerator(settings)
+        self._generators: dict[str, ReplyGenerator] = {
+            settings.default_reply_profile.name.casefold(): self.generator
+        }
         self.adapter = WeChatAdapter(settings)
         self.queue: queue.Queue = queue.Queue()  # 兼容旧版外部调用方
         self.worker_queues: dict[str, queue.Queue] = {
@@ -99,10 +102,11 @@ class ReplyService:
         self,
         chat_id: str | None = None,
         exclude_message_id: str | None = None,
+        max_history_messages: int | None = None,
     ) -> list[dict[str, str]]:
         """从微信刷新真实双方对话，过滤程序自己的 AI 回复。"""
         history = self.adapter.recent_history(
-            self.settings.max_history_messages,
+            self.settings.max_history_messages if max_history_messages is None else max_history_messages,
             exclude_message_id=exclude_message_id,
             chat_id=chat_id,
         )
@@ -115,6 +119,41 @@ class ReplyService:
             len(history),
         )
         return history
+
+    def _profile_for(self, message: Any) -> ReplyProfile:
+        resolver = getattr(self.settings, "reply_profile_for", None)
+        if callable(resolver):
+            return resolver(
+                getattr(message, "chat_name", ""),
+                getattr(message, "chat_id", ""),
+                getattr(message, "sender_name", ""),
+                getattr(message, "sender_id", ""),
+            )
+        # 保留轻量测试桩和旧的第三方 Settings 调用方式。
+        return ReplyProfile(
+            "默认方案",
+            getattr(self.settings, "system_prompt", ""),
+            getattr(self.settings, "reply_cooldown_seconds", 0),
+            getattr(self.settings, "max_history_messages", 100),
+            getattr(self.settings, "max_reply_chars", 500),
+            getattr(self.settings, "max_input_chars", 4000),
+            getattr(self.settings, "persona_path", None),
+        )
+
+    def _settings_for_profile(self, profile: ReplyProfile):
+        apply_profile = getattr(self.settings, "with_reply_profile", None)
+        return apply_profile(profile) if callable(apply_profile) else self.settings
+
+    def _generator_for(self, profile: ReplyProfile) -> ReplyGenerator:
+        key = profile.name.casefold()
+        if not hasattr(self, "_generators"):
+            return self.generator
+        with self._state_lock:
+            generator = self._generators.get(key)
+            if generator is None:
+                generator = ReplyGenerator(self.settings.with_reply_profile(profile))
+                self._generators[key] = generator
+            return generator
 
     def enqueue(self, message) -> None:
         if not is_target(message, self.settings.target_contacts):
@@ -151,7 +190,9 @@ class ReplyService:
                 work_queue.task_done()
                 break
             try:
-                allowed, reason = should_reply(message, self.settings, self.storage)
+                profile = self._profile_for(message)
+                profile_settings = self._settings_for_profile(profile)
+                allowed, reason = should_reply(message, profile_settings, self.storage)
                 self.storage.mark_processed(message.message_id, message.chat_id, message.content)
                 if not allowed:
                     logger.info("跳过消息：%s", reason)
@@ -174,6 +215,7 @@ class ReplyService:
                 history = self._refresh_history(
                     chat_id=message.chat_id,
                     exclude_message_id=message.message_id,
+                    max_history_messages=profile_settings.max_history_messages,
                 )
                 logger.info("开始调用模型服务生成回复：history=%s", len(history))
                 self._emit(
@@ -214,12 +256,12 @@ class ReplyService:
                         )
                         continue
                     prompt_message = "对方发送了一张图片。请先理解图片内容，再按我的语气回复。"
-                request = (message, prompt_message, image_path)
+                request = (message, prompt_message, image_path, profile.name)
                 with self._state_lock:
                     self._last_request = request
                     self._requests[message.message_id] = request
                 reply = add_ai_prefix(
-                    self.generator.generate(history, prompt_message, image_path=image_path)
+                    self._generator_for(profile).generate(history, prompt_message, image_path=image_path)
                 )
                 self.storage.add_message(message.chat_id, "user", prompt_message)
 
@@ -233,6 +275,7 @@ class ReplyService:
                         chat_id=message.chat_id,
                         message_id=message.message_id,
                         input_content=message.content,
+                        profile_name=profile.name,
                     )
                 else:
                     self._emit(
@@ -253,6 +296,7 @@ class ReplyService:
                         chat_id=message.chat_id,
                         message_id=message.message_id,
                         input_content=message.content,
+                        profile_name=profile.name,
                     )
             except Exception as exc:
                 logger.exception("处理消息失败；本条消息不会自动重试")
@@ -279,10 +323,14 @@ class ReplyService:
         request = self._request_for(message_id)
         if request is None:
             raise RuntimeError("还没有可重新生成的消息")
-        message, prompt_message, image_path = request
+        message, prompt_message, image_path, *profile_name = request
+        find_profile = getattr(self.settings, "reply_profile_named", None)
+        profile = find_profile(profile_name[0] if profile_name else None) if callable(find_profile) else self._profile_for(message)
+        profile_settings = self._settings_for_profile(profile)
         history = self._refresh_history(
             chat_id=message.chat_id,
             exclude_message_id=message.message_id,
+            max_history_messages=profile_settings.max_history_messages,
         )
         self._emit(
             "generating",
@@ -292,7 +340,7 @@ class ReplyService:
             message_id=message.message_id,
         )
         reply = add_ai_prefix(
-            self.generator.generate(history, prompt_message, image_path=image_path)
+            self._generator_for(profile).generate(history, prompt_message, image_path=image_path)
         )
         logger.info("已重新生成回复预览：%s", reply)
         self._emit(
@@ -304,6 +352,7 @@ class ReplyService:
             chat_id=message.chat_id,
             message_id=message.message_id,
             input_content=message.content,
+            profile_name=profile.name,
         )
 
     def _request_for(self, message_id: str | None = None):

@@ -16,7 +16,15 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from config import ENV_PATH, PROJECT_DIR, Settings, load_project_env, save_project_env
+from config import (
+    ENV_PATH,
+    PROJECT_DIR,
+    ReplyProfile,
+    Settings,
+    load_project_env,
+    save_project_env,
+    save_reply_profiles,
+)
 from media_cleanup import cleanup_media_cache
 
 
@@ -280,7 +288,7 @@ class PipelineCanvas(tk.Canvas):
 class AutoReplyApp:
     NAV_ITEMS = (
         ("工作台", "dashboard", "▰"),
-        ("回复规则", "rules", "☷"),
+        ("回复方案", "rules", "☷"),
         ("联系人与语气", "contact", "●"),
         ("AI 与图片", "ai", "✦"),
         ("运行日志", "logs", "▥"),
@@ -319,6 +327,13 @@ class AutoReplyApp:
         self._lmstudio_model_combo: Any | None = None
         self._lmstudio_model_status: tk.Label | None = None
         self._lmstudio_model_request_id = 0
+        self.profile_name_var: tk.StringVar | None = None
+        self.profile_vars: dict[str, tk.Variable | tk.Text] = {}
+        self.profile_assignment_vars: dict[str, tk.StringVar] = {}
+        self._editing_profiles: list[ReplyProfile] = []
+        self._profile_selector: Any | None = None
+        self._profile_assignment_host: tk.Frame | None = None
+        self._selected_profile_name = ""
 
         self._read_mode_default()
         self._build_shell()
@@ -571,16 +586,7 @@ class AutoReplyApp:
 
     def _build_settings_pages(self) -> None:
         self.page_builders = {
-            "rules": lambda: self._create_form_page(
-                "rules", "回复规则", "控制回复频率、上下文范围与输出边界。",
-                (
-                    ("回复冷却（秒）", "REPLY_COOLDOWN_SECONDS", "entry", "0 表示每条新消息都允许回复"),
-                    ("上下文消息数", "MAX_HISTORY_MESSAGES", "entry", "启动时及每次回复前读取的真实双方消息数量（过滤 AI 回复）"),
-                    ("最大回复字数", "MAX_REPLY_CHARS", "entry", "超出后由模型层截断"),
-                    ("最大输入字数", "MAX_INPUT_CHARS", "entry", "过长消息将被安全跳过"),
-                    ("回复指令", "SYSTEM_PROMPT", "text", "定义语气、边界与回复原则"),
-                ),
-            ),
+            "rules": self._create_reply_profiles_page,
             "contact": lambda: self._create_form_page(
                 "contact", "联系人与语气", "最多监听 3 个联系人；用逗号分隔备注名，并可加载离线语气画像。",
                 (
@@ -620,6 +626,203 @@ class AutoReplyApp:
                 ),
             ),
         }
+
+    def _create_reply_profiles_page(self) -> None:
+        """可热切换的方案编辑器，并在此将方案分配给监听联系人。"""
+        from tkinter import ttk
+
+        settings = Settings.from_env()
+        self._editing_profiles = list(settings.reply_profiles or (settings.default_reply_profile,))
+        page = tk.Frame(self.page_host, bg=COLORS["canvas"])
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+        self.pages["rules"] = page
+        header = tk.Frame(page, bg=COLORS["canvas"])
+        header.grid(row=0, column=0, sticky="ew", pady=(6, 18))
+        tk.Label(header, text="回复方案", bg=COLORS["canvas"], fg=COLORS["ink"], font=(FONT, 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="通过下拉框切换、保存多套语气和规则；每个监听联系人可使用不同方案。", bg=COLORS["canvas"], fg=COLORS["muted"], font=(FONT, 9)).pack(anchor="w", pady=(5, 0))
+        outer = self._card(page, row=1, column=0, sticky="nsew")
+        canvas = tk.Canvas(outer, bg=COLORS["panel"], highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=COLORS["panel"])
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        inner.grid_columnconfigure(0, minsize=310)
+        inner.grid_columnconfigure(1, weight=1)
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        tk.Label(inner, text="当前方案", bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(30, 28), pady=(24, 10))
+        selector_row = tk.Frame(inner, bg=COLORS["panel"])
+        selector_row.grid(row=0, column=1, sticky="ew", padx=(0, 30), pady=(24, 10))
+        selector_row.grid_columnconfigure(0, weight=1)
+        first = self._editing_profiles[0]
+        self.profile_name_var = tk.StringVar(value=first.name)
+        selector = ttk.Combobox(selector_row, state="readonly", values=[item.name for item in self._editing_profiles])
+        selector.set(first.name)
+        selector.grid(row=0, column=0, sticky="ew", ipady=5)
+        selector.bind("<<ComboboxSelected>>", lambda _event: self._load_selected_profile())
+        self._profile_selector = selector
+        self._button(selector_row, "新建方案", self._new_reply_profile).grid(row=0, column=1, padx=(8, 0))
+        self._button(selector_row, "删除", self._delete_reply_profile).grid(row=0, column=2, padx=(8, 0))
+        fields = (
+            ("方案名称", "name", "entry", "用于下拉选择和联系人分配，例如“客户简洁回复”"),
+            ("回复冷却（秒）", "reply_cooldown_seconds", "entry", "0 表示每条新消息都允许回复"),
+            ("上下文消息数", "max_history_messages", "entry", "该方案生成时读取的真实双方消息数量"),
+            ("最大回复字数", "max_reply_chars", "entry", "该方案的最终回复长度上限"),
+            ("最大输入字数", "max_input_chars", "entry", "超过后安全跳过，不调用模型"),
+            ("语气画像文件", "persona_path", "file", "可选；不同方案可使用不同 persona.json"),
+            ("回复指令", "system_prompt", "text", "定义该方案的语气、边界与回复原则"),
+        )
+        row = 1
+        for label, field, kind, help_text in fields:
+            left = tk.Frame(inner, bg=COLORS["panel"])
+            left.grid(row=row, column=0, sticky="new", padx=(30, 28), pady=14)
+            tk.Label(left, text=label, bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 10, "bold")).pack(anchor="w")
+            tk.Label(left, text=help_text, bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8), justify="left", wraplength=270).pack(anchor="w", pady=(4, 0))
+            control = tk.Frame(inner, bg=COLORS["panel"])
+            control.grid(row=row, column=1, sticky="ew", padx=(0, 30), pady=14)
+            if kind == "text":
+                widget = tk.Text(control, height=6, wrap="word", bg="#F8FAF8", fg=COLORS["text"], insertbackground=COLORS["ink"], relief="flat", highlightbackground=COLORS["line"], highlightthickness=1, padx=12, pady=10, font=(FONT, 10))
+                widget.pack(fill="both", expand=True)
+                self.profile_vars[field] = widget
+            else:
+                var = self.profile_name_var if field == "name" else tk.StringVar()
+                entry = tk.Entry(control, textvariable=var, bg="#F8FAF8", fg=COLORS["text"], insertbackground=COLORS["ink"], relief="flat", highlightbackground=COLORS["line"], highlightcolor=COLORS["green"], highlightthickness=1, font=(FONT, 10))
+                if kind == "file":
+                    self._button(control, "选择文件", lambda value=var: self._pick_file(value)).pack(side="right")
+                entry.pack(side="left", fill="x", expand=True, ipady=9, padx=(0, 8))
+                self.profile_vars[field] = var
+            row += 1
+            tk.Frame(inner, bg=COLORS["line"], height=1).grid(row=row, column=0, columnspan=2, sticky="ew", padx=30)
+            row += 1
+        assignment_title = tk.Frame(inner, bg=COLORS["panel"])
+        assignment_title.grid(row=row, column=0, columnspan=2, sticky="ew", padx=30, pady=(20, 4))
+        tk.Label(assignment_title, text="联系人方案分配", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 12, "bold")).pack(anchor="w")
+        tk.Label(assignment_title, text="未单独指定的联系人使用列表中的第一个（默认）方案。", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8)).pack(anchor="w", pady=(3, 0))
+        self._profile_assignment_host = tk.Frame(inner, bg=COLORS["panel"])
+        self._profile_assignment_host.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=30, pady=(4, 12))
+        footer = tk.Frame(inner, bg=COLORS["panel"])
+        footer.grid(row=row + 2, column=0, columnspan=2, sticky="ew", padx=30, pady=20)
+        self._button(footer, "保存全部方案", self._save_reply_profiles, primary=True).pack(side="right")
+        tk.Label(footer, text="运行中的监听服务在下次启动时使用新规则。", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8)).pack(side="right", padx=14)
+        self._load_profile_into_form(first)
+        self._render_profile_assignments(settings)
+
+    def _load_profile_into_form(self, profile: ReplyProfile) -> None:
+        values = {"name": profile.name, "reply_cooldown_seconds": str(profile.reply_cooldown_seconds), "max_history_messages": str(profile.max_history_messages), "max_reply_chars": str(profile.max_reply_chars), "max_input_chars": str(profile.max_input_chars), "persona_path": str(profile.persona_path or ""), "system_prompt": profile.system_prompt}
+        for field, value in values.items():
+            widget = self.profile_vars.get(field)
+            if isinstance(widget, tk.Text):
+                widget.delete("1.0", "end")
+                widget.insert("1.0", value)
+            elif isinstance(widget, tk.Variable):
+                widget.set(value)
+        self._selected_profile_name = profile.name
+
+    def _load_selected_profile(self) -> None:
+        # 切换下拉项前先暂存当前表单，避免编辑多套方案时丢失尚未点击保存的内容。
+        if self._selected_profile_name:
+            try:
+                edited = self._profile_from_form()
+                self._editing_profiles = [
+                    edited if item.name == self._selected_profile_name else item
+                    for item in self._editing_profiles
+                ]
+            except ValueError:
+                pass
+        selected = str(self._profile_selector.get()) if self._profile_selector is not None else ""
+        profile = next((item for item in self._editing_profiles if item.name == selected), None)
+        if profile:
+            self._load_profile_into_form(profile)
+
+    def _profile_from_form(self) -> ReplyProfile:
+        def value(field: str) -> str:
+            widget = self.profile_vars[field]
+            return widget.get("1.0", "end-1c").strip() if isinstance(widget, tk.Text) else str(widget.get()).strip()
+        name = value("name")
+        if not name:
+            raise ValueError("方案名称不能为空")
+        if len(name) > 60:
+            raise ValueError("方案名称不能超过 60 个字符")
+        return ReplyProfile(name, value("system_prompt"), int(normalize_numeric_setting("回复冷却（秒）", "REPLY_COOLDOWN_SECONDS", value("reply_cooldown_seconds"))), int(normalize_numeric_setting("上下文消息数", "MAX_HISTORY_MESSAGES", value("max_history_messages"))), max(1, int(normalize_numeric_setting("最大回复字数", "MAX_REPLY_CHARS", value("max_reply_chars")))), max(1, int(normalize_numeric_setting("最大输入字数", "MAX_INPUT_CHARS", value("max_input_chars")))), Path(value("persona_path")) if value("persona_path") else None)
+
+    def _refresh_profile_selector(self, selected: str) -> None:
+        if self._profile_selector is not None:
+            self._profile_selector.configure(values=[item.name for item in self._editing_profiles])
+            self._profile_selector.set(selected)
+
+    def _new_reply_profile(self) -> None:
+        try:
+            base = self._profile_from_form()
+        except ValueError:
+            base = self._editing_profiles[0]
+        existing = {item.name.casefold() for item in self._editing_profiles}
+        number = 1
+        while f"新方案 {number}".casefold() in existing:
+            number += 1
+        profile = ReplyProfile(f"新方案 {number}", base.system_prompt, base.reply_cooldown_seconds, base.max_history_messages, base.max_reply_chars, base.max_input_chars, base.persona_path)
+        self._editing_profiles.append(profile)
+        self._refresh_profile_selector(profile.name)
+        self._load_profile_into_form(profile)
+        self._render_profile_assignments(Settings.from_env())
+
+    def _delete_reply_profile(self) -> None:
+        if len(self._editing_profiles) <= 1:
+            messagebox.showinfo("保留一个方案", "至少需要保留一个回复方案。", parent=self.root)
+            return
+        selected = str(self._profile_selector.get()) if self._profile_selector is not None else ""
+        if not messagebox.askyesno("删除方案", f"确定删除“{selected}”吗？使用它的联系人将改用默认方案。", parent=self.root):
+            return
+        self._editing_profiles = [item for item in self._editing_profiles if item.name != selected]
+        replacement = self._editing_profiles[0]
+        for variable in self.profile_assignment_vars.values():
+            if variable.get() == selected:
+                variable.set(replacement.name)
+        self._refresh_profile_selector(replacement.name)
+        self._load_profile_into_form(replacement)
+        self._render_profile_assignments(Settings.from_env())
+
+    def _render_profile_assignments(self, settings: Settings) -> None:
+        if self._profile_assignment_host is None:
+            return
+        previous = {contact: variable.get() for contact, variable in self.profile_assignment_vars.items()}
+        for child in self._profile_assignment_host.winfo_children():
+            child.destroy()
+        self.profile_assignment_vars = {}
+        saved = {contact.casefold(): name for contact, name in settings.contact_profile_assignments}
+        names = [item.name for item in self._editing_profiles]
+        for contact in settings.target_contacts:
+            row = tk.Frame(self._profile_assignment_host, bg=COLORS["panel"])
+            row.pack(fill="x", pady=5)
+            tk.Label(row, text=contact, bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 10, "bold"), width=24, anchor="w").pack(side="left")
+            var = tk.StringVar(value=previous.get(contact) or saved.get(contact.casefold()) or names[0])
+            if var.get() not in names:
+                var.set(names[0])
+            tk.OptionMenu(row, var, *names).pack(side="left")
+            self.profile_assignment_vars[contact] = var
+        if not settings.target_contacts:
+            tk.Label(self._profile_assignment_host, text="请先在“联系人与语气”中填写监听对象，再回来分配回复方案。", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 9)).pack(anchor="w", pady=8)
+
+    def _save_reply_profiles(self) -> None:
+        try:
+            current = self._profile_from_form()
+            selected = str(self._profile_selector.get()) if self._profile_selector is not None else current.name
+            if any(item.name.casefold() == current.name.casefold() and item.name != selected for item in self._editing_profiles):
+                raise ValueError("方案名称不能重复")
+            self._editing_profiles = [current if item.name == selected else item for item in self._editing_profiles]
+            for variable in self.profile_assignment_vars.values():
+                if variable.get() == selected:
+                    variable.set(current.name)
+            save_reply_profiles(tuple(self._editing_profiles), {contact: variable.get() for contact, variable in self.profile_assignment_vars.items()})
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法保存", f"请检查方案配置：{exc}", parent=self.root)
+            return
+        self._refresh_profile_selector(current.name)
+        self._sync_settings_summary()
+        self._add_activity("回复方案已保存，下次启动监听后生效", "info")
+        messagebox.showinfo("已保存", "回复方案和联系人分配已保存到本机。", parent=self.root)
 
     def _create_form_page(self, key: str, title: str, subtitle: str, fields: tuple[tuple[str, str, str, str], ...]) -> None:
         page = tk.Frame(self.page_host, bg=COLORS["canvas"])

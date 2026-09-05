@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from config import Settings, load_project_env, save_project_env
+from config import ReplyProfile, Settings, load_project_env, save_project_env, save_reply_profiles
 
 
 def test_ccswitch_is_default_and_has_local_route(monkeypatch):
@@ -81,3 +81,18 @@ def test_persisted_env_overrides_inherited_environment(monkeypatch, tmp_path):
     load_project_env()
 
     assert Settings.from_env().system_prompt == "已保存的指令"
+
+
+def test_reply_profiles_are_persisted_and_matched_by_contact(monkeypatch, tmp_path):
+    profiles_path = tmp_path / "reply_profiles.json"
+    monkeypatch.setattr("config.REPLY_PROFILES_PATH", profiles_path)
+    default = ReplyProfile("默认方案", "默认语气", 0, 100, 500, 4000)
+    customer = ReplyProfile("客户", "专业、简洁", 15, 20, 80, 1000)
+
+    save_reply_profiles((default, customer), {"客户A": "客户"})
+    monkeypatch.setenv("WECHAT_TARGETS", "客户A,朋友B")
+    settings = Settings.from_env()
+
+    assert settings.reply_profile_for("客户A").name == "客户"
+    assert settings.reply_profile_for("朋友B").name == "默认方案"
+    assert settings.with_reply_profile(settings.reply_profile_for("客户A")).max_reply_chars == 80
