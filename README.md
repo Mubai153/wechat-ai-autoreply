@@ -180,6 +180,8 @@ WEB_SEARCH_MAX_RESULTS=5
 WEB_SEARCH_TIMEOUT_SECONDS=15
 ```
 
+也可以在工作台“快速设置”中切换“联网搜索”。该开关仅在 `LLM_PROVIDER=lmstudio` 时可用，并需要本机 SearXNG 服务已启动。
+
 服务只绑定到 `127.0.0.1`，不会向局域网开放。模型支持 function calling 时可自行调用搜索；不支持时，程序会在“搜索、最新、天气、新闻、价格、汇率”等明确实时意图中自动补充搜索结果。搜索请求仍会被 SearXNG 转发给它启用的公开搜索引擎，因此不要把私人聊天原文当作搜索关键词。关闭服务可执行 `docker compose -f searxng\docker-compose.yml down`；关闭功能只需把 `WEB_SEARCH_ENABLED` 改为 `false` 并重启程序。
 
 ### 方式 D：OpenAI 兼容接口

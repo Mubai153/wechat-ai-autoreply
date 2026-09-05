@@ -510,17 +510,28 @@ class AutoReplyApp:
         middle.grid_columnconfigure(1, weight=1)
 
         reply = self._card(middle, row=0, column=0, sticky="nsew", padx=(0, 10))
+        reply.grid_rowconfigure(0, weight=1)
         reply.grid_columnconfigure(0, weight=1)
-        tk.Label(reply, text="实时回复", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=22, pady=(13, 0))
-        tk.Label(reply, text="最近一条消息与生成结果", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8), anchor="w").grid(row=1, column=0, sticky="ew", padx=22, pady=(3, 12))
-        self.incoming_box = tk.Frame(reply, bg="#F2F4F3")
+        reply_canvas = tk.Canvas(reply, bg=COLORS["panel"], highlightthickness=0)
+        reply_scrollbar = tk.Scrollbar(reply, orient="vertical", command=reply_canvas.yview)
+        reply_content = tk.Frame(reply_canvas, bg=COLORS["panel"])
+        reply_window = reply_canvas.create_window((0, 0), window=reply_content, anchor="nw")
+        reply_canvas.configure(yscrollcommand=reply_scrollbar.set)
+        reply_canvas.grid(row=0, column=0, sticky="nsew")
+        reply_scrollbar.grid(row=0, column=1, sticky="ns")
+        reply_content.grid_columnconfigure(0, weight=1)
+        reply_content.bind("<Configure>", lambda _event: reply_canvas.configure(scrollregion=reply_canvas.bbox("all")))
+        reply_canvas.bind("<Configure>", lambda event: reply_canvas.itemconfigure(reply_window, width=event.width))
+        tk.Label(reply_content, text="实时回复", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=22, pady=(13, 0))
+        tk.Label(reply_content, text="最近一条消息与生成结果", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8), anchor="w").grid(row=1, column=0, sticky="ew", padx=22, pady=(3, 12))
+        self.incoming_box = tk.Frame(reply_content, bg="#F2F4F3")
         self.incoming_box.grid(row=2, column=0, sticky="ew", padx=22)
         self.incoming_sender = tk.Label(self.incoming_box, text="暂无消息", bg="#F2F4F3", fg=COLORS["muted"], font=(FONT, 8), anchor="w")
         self.incoming_sender.pack(fill="x", padx=16, pady=(7, 1))
         self.incoming_text = tk.Label(self.incoming_box, text="启动监听后，新消息会显示在这里。", bg="#F2F4F3", fg=COLORS["text"], font=(FONT, 11), anchor="w", justify="left", wraplength=660)
         self.incoming_text.pack(fill="x", padx=16, pady=(0, 8))
 
-        self.reply_box = tk.Frame(reply, bg=COLORS["green_pale"], highlightbackground="#BDE8CE", highlightthickness=1)
+        self.reply_box = tk.Frame(reply_content, bg=COLORS["green_pale"], highlightbackground="#BDE8CE", highlightthickness=1)
         self.reply_box.grid(row=3, column=0, sticky="nsew", padx=22, pady=8)
         self.reply_box.grid_columnconfigure(0, weight=1)
         self.reply_status = tk.Label(self.reply_box, text="AI 回复预览", bg=COLORS["green_pale"], fg=COLORS["green_dark"], font=(FONT, 9, "bold"), anchor="w")
@@ -538,20 +549,31 @@ class AutoReplyApp:
         self._button(reply_actions, "复制回复", self._copy_reply).pack(side="right")
 
         runtime = self._card(middle, row=0, column=1, sticky="nsew")
-        runtime_head = tk.Frame(runtime, bg=COLORS["panel"])
+        runtime.grid_rowconfigure(0, weight=1)
+        runtime.grid_columnconfigure(0, weight=1)
+        runtime_canvas = tk.Canvas(runtime, bg=COLORS["panel"], highlightthickness=0)
+        runtime_scrollbar = tk.Scrollbar(runtime, orient="vertical", command=runtime_canvas.yview)
+        runtime_content = tk.Frame(runtime_canvas, bg=COLORS["panel"])
+        runtime_window = runtime_canvas.create_window((0, 0), window=runtime_content, anchor="nw")
+        runtime_canvas.configure(yscrollcommand=runtime_scrollbar.set)
+        runtime_canvas.grid(row=0, column=0, sticky="nsew")
+        runtime_scrollbar.grid(row=0, column=1, sticky="ns")
+        runtime_content.bind("<Configure>", lambda _event: runtime_canvas.configure(scrollregion=runtime_canvas.bbox("all")))
+        runtime_canvas.bind("<Configure>", lambda event: runtime_canvas.itemconfigure(runtime_window, width=event.width))
+        runtime_head = tk.Frame(runtime_content, bg=COLORS["panel"])
         runtime_head.pack(fill="x", padx=22, pady=(12, 3))
         tk.Label(runtime_head, text="运行状态", bg=COLORS["panel"], fg=COLORS["ink"], font=(FONT, 13, "bold"), anchor="w").pack(side="left")
         self._link_button(runtime_head, "调整设置  →", lambda: self._show_page("ai")).pack(side="right")
         self.runtime_values: dict[str, tk.Label] = {}
         for name in ("微信连接", "模型服务", "后台发送"):
-            row = tk.Frame(runtime, bg=COLORS["panel"])
+            row = tk.Frame(runtime_content, bg=COLORS["panel"])
             row.pack(fill="x", padx=22, pady=5)
             tk.Label(row, text="●", bg=COLORS["panel"], fg="#B7C1BC", font=(FONT, 9)).pack(side="left")
             tk.Label(row, text=name, bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 9)).pack(side="left", padx=8)
             value = tk.Label(row, text="未检查", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 9, "bold"))
             value.pack(side="right")
             self.runtime_values[name] = value
-        self.runtime_quick = tk.Frame(runtime, bg=COLORS["panel"])
+        self.runtime_quick = tk.Frame(runtime_content, bg=COLORS["panel"])
         self.runtime_quick.pack(fill="x")
         tk.Frame(self.runtime_quick, bg=COLORS["line"], height=1).pack(fill="x", padx=22, pady=(4, 6))
         tk.Label(self.runtime_quick, text="快速设置", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8), anchor="w").pack(fill="x", padx=22)
@@ -562,6 +584,12 @@ class AutoReplyApp:
         tk.Label(image_row, text="图片识别", bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 9)).pack(side="left")
         self.quick_image_var = tk.BooleanVar(value=settings.image_recognition_enabled)
         Toggle(image_row, self.quick_image_var, self._quick_image_changed).pack(side="right")
+        search_row = tk.Frame(self.runtime_quick, bg=COLORS["panel"])
+        search_row.pack(fill="x", padx=22, pady=3)
+        tk.Label(search_row, text="联网搜索", bg=COLORS["panel"], fg=COLORS["text"], font=(FONT, 9)).pack(side="left")
+        self.quick_web_search_var = tk.BooleanVar(value=settings.web_search_enabled)
+        Toggle(search_row, self.quick_web_search_var, self._quick_web_search_changed).pack(side="right")
+        tk.Label(search_row, text="仅支持 LM Studio + 本机 SearXNG", bg=COLORS["panel"], fg=COLORS["muted"], font=(FONT, 8)).pack(side="right", padx=(0, 10))
 
         activity = self._card(page, row=3, column=0, sticky="ew")
         self.dashboard_activity = activity
@@ -1027,6 +1055,7 @@ class AutoReplyApp:
         self.quick_cooldown.configure(text=f"{settings.reply_cooldown_seconds} 秒")
         self.quick_history.configure(text=f"{settings.max_history_messages} 条")
         self.quick_image_var.set(settings.image_recognition_enabled)
+        self.quick_web_search_var.set(settings.web_search_enabled)
 
     def _quick_image_changed(self) -> None:
         value = "true" if self.quick_image_var.get() else "false"
@@ -1039,6 +1068,27 @@ class AutoReplyApp:
         if isinstance(form, tk.BooleanVar):
             form.set(self.quick_image_var.get())
         self._add_activity("图片识别已开启" if self.quick_image_var.get() else "图片识别已关闭", "info")
+
+    def _quick_web_search_changed(self) -> None:
+        enabled = self.quick_web_search_var.get()
+        if enabled and Settings.from_env().llm_provider != "lmstudio":
+            self.quick_web_search_var.set(False)
+            messagebox.showwarning(
+                "联网搜索不可用",
+                "联网搜索目前只支持 LM Studio。请先在“AI 与图片”中切换模型来源。",
+                parent=self.root,
+            )
+            return
+        try:
+            save_project_env({"WEB_SEARCH_ENABLED": "true" if enabled else "false"})
+        except OSError as exc:
+            self.quick_web_search_var.set(not enabled)
+            messagebox.showerror("无法保存", f"配置文件写入失败：{exc}", parent=self.root)
+            return
+        form = self.form_vars.get("WEB_SEARCH_ENABLED")
+        if isinstance(form, tk.BooleanVar):
+            form.set(enabled)
+        self._add_activity("联网搜索已开启" if enabled else "联网搜索已关闭", "info")
 
     def _show_page(self, key: str) -> None:
         if key not in self.pages:
