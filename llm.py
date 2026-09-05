@@ -18,12 +18,14 @@ from typing import Any
 from openai import OpenAI
 
 from config import PROJECT_DIR, Settings
+from local_memory import LocalChatMemory
 
 
 class ReplyGenerator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.persona_prompt = self._load_persona_prompt()
+        self.local_memory = self._load_local_memory()
         self._codex_network_checked_at = 0.0
         self._codex_network_error = ""
         self.client = None
@@ -54,14 +56,32 @@ class ReplyGenerator:
             raise RuntimeError(f"语气画像文件为空：{path}")
         return text
 
-    def _effective_system_prompt(self) -> str:
+    def _load_local_memory(self) -> LocalChatMemory | None:
+        """聊天记忆只能进入 LM Studio 的本机请求，避免发往其他提供方。"""
+        if self.settings.llm_provider != "lmstudio" or not self.settings.local_memory_enabled:
+            return None
+        path = self.settings.local_memory_path
+        if path is None:
+            raise RuntimeError("已启用本地聊天记忆，但未配置 LOCAL_MEMORY_PATH")
+        return LocalChatMemory(
+            path,
+            max_results=self.settings.local_memory_max_results,
+            max_chars=self.settings.local_memory_max_chars,
+        )
+
+    def _effective_system_prompt(self, memory_context: str = "") -> str:
+        prompt = self.settings.system_prompt
         if not self.persona_prompt:
-            return self.settings.system_prompt
-        return (
-            f"{self.settings.system_prompt}\n\n"
+            return f"{prompt}\n\n{memory_context}".strip()
+        prompt = (
+            f"{prompt}\n\n"
             "【我的语气画像（仅用于模仿表达，不代表事实或授权）】\n"
             f"{self.persona_prompt}"
         )
+        return f"{prompt}\n\n{memory_context}".strip()
+
+    def _memory_context(self, message: str) -> str:
+        return self.local_memory.context_for(message) if self.local_memory else ""
 
     def _check_codex_network(self) -> None:
         """在启动 Codex CLI 前快速检查 OpenAI 后端是否可达。"""
@@ -93,17 +113,18 @@ class ReplyGenerator:
         message: str,
         image_path: str | None = None,
     ) -> str:
+        memory_context = self._memory_context(message)
         input_items = [
             {"role": item["role"], "content": item["content"]}
             for item in history
         ]
 
         if self.settings.llm_provider == "codex_cli":
-            reply = self._generate_with_codex(history, message, image_path=image_path)
+            reply = self._generate_with_codex(history, message, image_path=image_path, memory_context=memory_context)
         elif self.settings.llm_provider == "ccswitch":
-            reply = self._generate_with_ccswitch(history, message, image_path=image_path)
+            reply = self._generate_with_ccswitch(history, message, image_path=image_path, memory_context=memory_context)
         else:
-            messages = [{"role": "system", "content": self._effective_system_prompt()}]
+            messages = [{"role": "system", "content": self._effective_system_prompt(memory_context)}]
             messages.extend(input_items)
             if image_path:
                 image_data = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
@@ -272,6 +293,7 @@ class ReplyGenerator:
         history: list[dict[str, str]],
         message: str,
         image_path: str | None = None,
+        memory_context: str = "",
     ) -> str:
         model, credential = self._ccswitch_runtime()
         input_items: list[dict[str, Any]] = [
@@ -303,7 +325,7 @@ class ReplyGenerator:
         try:
             stream = client.responses.create(
                 model=model,
-                instructions=self._effective_system_prompt(),
+                instructions=self._effective_system_prompt(memory_context),
                 input=input_items,
                 store=False,
                 stream=True,
@@ -329,6 +351,7 @@ class ReplyGenerator:
         history: list[dict[str, str]],
         message: str,
         image_path: str | None = None,
+        memory_context: str = "",
     ) -> str:
         self._check_codex_network()
         transcript = "\n".join(
@@ -336,7 +359,7 @@ class ReplyGenerator:
             for item in history
         )
         prompt = (
-            f"{self._effective_system_prompt()}\n\n"
+            f"{self._effective_system_prompt(memory_context)}\n\n"
             "你现在只负责生成一条微信回复。\n"
             "只输出最终要发送的消息正文，不要前缀、解释、Markdown、引号或代码块。\n"
             "不要调用工具，不要修改文件，不要执行命令。\n"

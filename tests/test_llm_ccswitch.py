@@ -194,6 +194,46 @@ def test_lmstudio_uses_configured_model_with_chat_completions(monkeypatch):
     assert requests[0]["messages"][-1] == {"role": "user", "content": "你好"}
 
 
+def test_lmstudio_includes_retrieved_local_memory_but_other_providers_do_not(monkeypatch, tmp_path):
+    memory_path = tmp_path / "memory.jsonl"
+    memory_path.write_text('{"text":"今晚一起吃火锅吗"}\n', encoding="utf-8")
+    settings = _settings()
+    object.__setattr__(settings, "llm_provider", "lmstudio")
+    object.__setattr__(settings, "llm_model", "local-model")
+    object.__setattr__(settings, "llm_base_url", "http://127.0.0.1:1234/v1")
+    object.__setattr__(settings, "llm_api_key", "lm-studio")
+    object.__setattr__(settings, "local_memory_enabled", True)
+    object.__setattr__(settings, "local_memory_path", memory_path)
+    requests = []
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="本地回复"))]
+            )
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        @staticmethod
+        def close():
+            return None
+
+    monkeypatch.setattr("llm.OpenAI", FakeClient)
+    assert ReplyGenerator(settings).generate([], "晚上吃火锅吗") == "本地回复"
+    assert "今晚一起吃火锅吗" in requests[0]["messages"][0]["content"]
+
+    object.__setattr__(settings, "llm_provider", "ccswitch")
+    generator = ReplyGenerator.__new__(ReplyGenerator)
+    generator.settings = settings
+    generator.persona_prompt = ""
+    generator.local_memory = None
+    assert generator._memory_context("晚上吃火锅吗") == ""
+
+
 def test_lmstudio_can_auto_select_first_model(monkeypatch):
     settings = _settings()
     object.__setattr__(settings, "llm_provider", "lmstudio")

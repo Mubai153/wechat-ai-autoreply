@@ -240,6 +240,11 @@ class Settings:
     media_retention_days: int = 7
     media_cache_max_mb: int = 512
     media_cleanup_interval_seconds: int = 3600
+    # 仅 LM Studio 可使用的离线聊天记忆；其他提供方绝不加载或发送它。
+    local_memory_enabled: bool = False
+    local_memory_path: Path | None = None
+    local_memory_max_results: int = 6
+    local_memory_max_chars: int = 800
     # 新配置优先使用 WECHAT_TARGETS；保留 wechat_target 兼容旧版调用方。
     wechat_targets: tuple[str, ...] = ()
     # 独立方案保存在 data/reply_profiles.json，不与包含凭据的 .env 混放。
@@ -341,6 +346,13 @@ class Settings:
             if not persona_path.is_absolute():
                 persona_path = PROJECT_DIR / persona_path
 
+        memory_raw = os.getenv("LOCAL_MEMORY_PATH", "").strip()
+        memory_path = None
+        if memory_raw:
+            memory_path = Path(memory_raw)
+            if not memory_path.is_absolute():
+                memory_path = PROJECT_DIR / memory_path
+
         legacy_target = os.getenv("WECHAT_TARGET", "").strip()
         targets_raw = os.getenv("WECHAT_TARGETS", "")
         targets: list[str] = []
@@ -394,6 +406,10 @@ class Settings:
             media_retention_days=max(0, _int("MEDIA_RETENTION_DAYS", 7)),
             media_cache_max_mb=max(0, _int("MEDIA_CACHE_MAX_MB", 512)),
             media_cleanup_interval_seconds=max(60, _int("MEDIA_CLEANUP_INTERVAL_SECONDS", 3600)),
+            local_memory_enabled=_bool("LOCAL_MEMORY_ENABLED", False),
+            local_memory_path=memory_path,
+            local_memory_max_results=max(1, _int("LOCAL_MEMORY_MAX_RESULTS", 6)),
+            local_memory_max_chars=max(100, _int("LOCAL_MEMORY_MAX_CHARS", 800)),
             wechat_targets=tuple(targets),
             reply_profiles=profiles,
             contact_profile_assignments=assignments,
@@ -431,6 +447,11 @@ class Settings:
                 "::1",
             }:
                 raise ValueError("LMSTUDIO_BASE_URL 必须是本机回环地址")
+        if self.llm_provider == "lmstudio" and self.local_memory_enabled:
+            if self.local_memory_path is None:
+                missing.append("LOCAL_MEMORY_PATH")
+            elif not self.local_memory_path.is_file():
+                raise ValueError(f"找不到本地聊天记忆文件：{self.local_memory_path}")
         targets = self.target_contacts
         if not targets:
             missing.append("WECHAT_TARGETS（或 WECHAT_TARGET）")

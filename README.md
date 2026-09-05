@@ -278,6 +278,10 @@ GUI 打开时会按 `.env` 的 `AUTO_SEND` 选择初始模式，但必须点击�
 | `MAX_INPUT_CHARS` | `4000` | 输入最大字符数，过长消息会跳过 |
 | `SYSTEM_PROMPT` | 见 `.env.example` | 回复语气、边界和行为指令 |
 | `PERSONA_PATH` | 空 | 可选的 UTF-8 语气画像文件路径，可用相对路径或绝对路径 |
+| `LOCAL_MEMORY_ENABLED` | `false` | 仅 LM Studio 启用本地聊天记忆；其他模型提供方不会读取或发送该数据 |
+| `LOCAL_MEMORY_PATH` | `data/raw/my_wechat_messages.jsonl` | 本人历史发言的 JSONL 文件路径，由本地提取工具生成 |
+| `LOCAL_MEMORY_MAX_RESULTS` | `6` | 每次回复最多检索的相关历史片段数 |
+| `LOCAL_MEMORY_MAX_CHARS` | `800` | 注入本地模型上下文的历史片段总字数上限 |
 | `DATABASE_PATH` | `data/wechat_autoreply.sqlite3` | 本地去重和回复状态数据库 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`、`INFO`、`WARNING` 或 `ERROR` |
 
