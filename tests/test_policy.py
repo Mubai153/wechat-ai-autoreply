@@ -90,12 +90,13 @@ def test_listener_drops_self_sender_messages():
     adapter.target_username = "wxid_xiaoming"
     adapter.settings = settings(Path("."))
     adapter._self_ids = set()
+    adapter._self_sender_ids_by_chat = {"wxid_xiaoming": {"1"}}
     received = []
 
     adapter.listen(received.append)
     callback = callbacks["wxid_xiaoming"]
-    callback({"sender_id": 2, "origin_source": 2, "content": "我发的"}, None)
-    callback({"sender_id": 4, "origin_source": 1, "content": "对方发的"}, None)
+    callback({"sender_id": 1, "status": 3, "origin_source": 2, "content": "我发的"}, None)
+    callback({"sender_id": 2, "status": 3, "origin_source": 2, "content": "对方发的"}, None)
 
     assert [item.content for item in received] == ["对方发的"]
 

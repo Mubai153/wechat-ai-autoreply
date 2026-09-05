@@ -19,6 +19,21 @@ def test_incoming_status_wins_over_internal_sender_id_two():
     assert not _is_outgoing({"sender_id": 2, "status": 3})
 
 
+def test_phone_sent_message_uses_sender_id_learned_from_desktop_sent_message():
+    # 同一会话里，电脑端发送的 status=2 消息可用于识别手机端的 status=3 自发消息。
+    assert _is_outgoing({"sender_id": 1, "status": 3}, self_sender_ids={"1"})
+    assert not _is_outgoing({"sender_id": 2, "status": 3}, self_sender_ids={"1"})
+
+
+def test_sender_name_can_confirm_message_direction():
+    assert _is_outgoing({"sender_name": "飞鸟折白梅", "status": 3}, self_names={"飞鸟折白梅"})
+    assert not _is_outgoing(
+        {"sender_name": "89", "status": 3},
+        self_names={"飞鸟折白梅"},
+        peer_names={"89"},
+    )
+
+
 def _adapter(messages):
     class FakeDB:
         @staticmethod

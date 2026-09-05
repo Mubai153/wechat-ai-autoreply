@@ -26,14 +26,17 @@ def _is_outgoing(
     raw: dict[str, Any],
     *,
     self_ids: set[str] | None = None,
+    self_sender_ids: set[str] | None = None,
+    self_names: set[str] | None = None,
+    peer_names: set[str] | None = None,
 ) -> bool:
     """识别当前账号自己发出的消息，防止自动回复形成自我循环。
 
     ``origin_source`` 表示消息来源渠道，并不是收发方向；不同版本的
     微信会给它写入 1、2、3、5 等多个值。微信 4.x 消息表中
-    ``status=2`` 表示本机已发送，其他明确的 status 按对方消息处理。
-    不能把 ``sender_id=2`` 当作本人：这是消息表里的内部发送者编号，
-    在当前微信版本中对方消息也可能使用该编号。
+    ``status=2`` 通常表示本机发送，但手机端发出的同账号消息可能以
+    ``status=3`` 写入。此时要结合本会话中由 ``status=2`` 学到的
+    ``sender_id``，不能只按 status 判断。
     """
     explicit_false = False
     for key in ("is_self", "is_send", "is_sender", "IsSender"):
@@ -45,27 +48,38 @@ def _is_outgoing(
         if value in {"0", "false", "no", "n", "off"}:
             explicit_false = True
 
-    # 当前适配器会把消息表的 status 原样带出。只要 status 可解析，
-    # 就以它为唯一方向依据，不能再落入 sender_id=2 的旧兼容判断。
-    status = raw.get("status")
-    if status is not None and str(status).strip():
-        try:
-            return int(status) == 2
-        except (TypeError, ValueError):
-            pass
-
     # 适配器原始消息通常来自 real_sender_id，转换后为 sender_id。
     sender_keys = ("sender_id", "real_sender_id", "senderId", "realSenderId")
     has_sender = False
+    sender_values: list[str] = []
     for key in sender_keys:
         if key not in raw or raw[key] is None or not str(raw[key]).strip():
             continue
         has_sender = True
         value = str(raw[key]).strip().casefold()
-        if value in {"2", "self", "me", "我"}:
+        sender_values.append(value)
+
+    # 手机端发送的消息在部分微信版本中 status=3，但会复用本会话中
+    # 电脑端发送消息的 sender_id。这个会话级集合优先于 status。
+    if self_sender_ids:
+        known_self_sender_ids = {str(value).strip().casefold() for value in self_sender_ids}
+        if any(value in known_self_sender_ids for value in sender_values):
             return True
-        if self_ids and value in self_ids:
-            return True
+
+    if self_ids and any(value in self_ids for value in sender_values):
+        return True
+
+    # 某些上游适配器会直接给出发送者昵称/备注名。只读取明确的发送者
+    # 字段，不把会话本身的 nickname 当作发送者，避免一对一聊天误判。
+    sender_names = {
+        str(raw.get(key, "")).strip().casefold()
+        for key in ("sender_name", "sender_nickname", "senderNickName", "from_name", "SenderName")
+        if str(raw.get(key, "")).strip()
+    }
+    if self_names and sender_names & {str(value).strip().casefold() for value in self_names}:
+        return True
+    if peer_names and sender_names & {str(value).strip().casefold() for value in peer_names}:
+        return False
 
     # 某些上游对象只保留 sender_username/from_user；若能提供当前账号
     # 的微信号，也可以在没有数字 sender_id 时准确识别自己。
@@ -74,6 +88,20 @@ def _is_outgoing(
             value = str(raw.get(key, "")).strip().casefold()
             if value and value in self_ids:
                 return True
+
+    # 当前适配器会把消息表的 status 原样带出。status 存在时不能再把
+    # sender_id=2 这个旧兼容值直接当作本人，否则会误吞对方消息。
+    status = raw.get("status")
+    if status is not None and str(status).strip():
+        try:
+            return int(status) == 2
+        except (TypeError, ValueError):
+            pass
+
+    # 旧版适配器没有 status 时仍使用 2/self/me 表示本人；只保留这条
+    # 兼容路径，不让它覆盖带明确 status 的新消息。
+    if any(value in {"2", "self", "me", "我"} for value in sender_values):
+        return True
 
     if explicit_false:
         return False
@@ -249,7 +277,7 @@ class WeChatAdapter:
         self._send_lock = threading.RLock()
         self.db = ShardedWeChatDB(WeChatDB)
         self._self_ids: set[str] = set()
-        # sender_id=2 是主判定；微信号作为部分上游版本的备用身份字段。
+        self._self_names: set[str] = set()
         self_wxid = getattr(self.db, "wxid", "")
         if self_wxid:
             self._self_ids.add(str(self_wxid).strip().casefold())
@@ -262,6 +290,10 @@ class WeChatAdapter:
                 value = self_info.get(key)
                 if value:
                     self._self_ids.add(str(value).strip().casefold())
+            for key in ("nickname", "nick_name", "NickName", "remark", "remark_name", "RemarkName", "display_name"):
+                value = self_info.get(key)
+                if value:
+                    self._self_names.add(str(value).strip().casefold())
         self.target_usernames: dict[str, str] = {}
         for target in settings.target_contacts:
             username = self._resolve_target(target)
@@ -269,7 +301,66 @@ class WeChatAdapter:
                 raise RuntimeError(f"联系人配置重复或指向同一会话：{target}")
             self.target_usernames[target] = username
         self.target_username = next(iter(self.target_usernames.values()), "")
+        self._peer_names_by_chat: dict[str, set[str]] = {
+            username: {target.strip().casefold()}
+            for target, username in self.target_usernames.items()
+            if target.strip()
+        }
+        # sender_id 在 4.x 的一对一会话里可能是会话内编号，且手机端
+        # 发言的 status 不一定与电脑端相同。为每个目标会话从已有的
+        # status=2 消息学习“本人”的 sender_id。
+        self._self_sender_ids_by_chat: dict[str, set[str]] = {}
+        for username in self.target_usernames.values():
+            self._learn_self_sender_ids(username)
         self.listener = Listener(self.db, interval=1.0)
+
+    @staticmethod
+    def _raw_sender_values(raw: dict[str, Any]) -> set[str]:
+        values: set[str] = set()
+        for key in ("sender_id", "real_sender_id", "senderId", "realSenderId"):
+            value = raw.get(key)
+            if value is not None and str(value).strip():
+                values.add(str(value).strip().casefold())
+        return values
+
+    def _learn_self_sender_ids(self, chat_id: str) -> None:
+        learned: set[str] = set()
+        try:
+            rows = self.db.get_messages(chat_id, limit=200)
+        except Exception as exc:
+            logger.debug("无法从会话历史学习本人 sender_id：chat=%s, error=%s", chat_id, exc)
+            self._self_sender_ids_by_chat[chat_id] = learned
+            return
+        for raw in rows or []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                is_sent = int(raw.get("status")) == 2
+            except (TypeError, ValueError):
+                is_sent = False
+            if is_sent:
+                learned.update(self._raw_sender_values(raw))
+        self._self_sender_ids_by_chat[chat_id] = learned
+        if learned:
+            logger.debug("已学习会话本人 sender_id：chat=%s, sender_ids=%s", chat_id, sorted(learned))
+
+    def _is_outgoing_for_chat(self, raw: dict[str, Any], chat_id: str | None = None) -> bool:
+        chat_key = chat_id or _first(raw, "username", "chat_id", "talker_id")
+        by_chat = getattr(self, "_self_sender_ids_by_chat", {})
+        learned = by_chat.setdefault(chat_key, set()) if chat_key else set()
+        try:
+            is_sent = int(raw.get("status")) == 2
+        except (TypeError, ValueError):
+            is_sent = False
+        if is_sent:
+            learned.update(self._raw_sender_values(raw))
+        return _is_outgoing(
+            raw,
+            self_ids=getattr(self, "_self_ids", None),
+            self_sender_ids=learned,
+            self_names=getattr(self, "_self_names", None),
+            peer_names=getattr(self, "_peer_names_by_chat", {}).get(chat_key, set()),
+        )
 
     def _resolve_target(self, target: str | None = None) -> str:
         target = target or self.settings.wechat_target
@@ -373,7 +464,7 @@ class WeChatAdapter:
             if not isinstance(raw, dict):
                 logger.debug("忽略非字典消息：%r", raw)
                 return
-            if _is_outgoing(raw, self_ids=getattr(self, "_self_ids", None)):
+            if self._is_outgoing_for_chat(raw, target_username):
                 logger.debug(
                     "忽略本机发出的消息：local_id=%s, sort_seq=%s",
                     _first(raw, "local_id", "msg_id", "MsgId", default="unknown"),
@@ -459,7 +550,7 @@ class WeChatAdapter:
                 if message is None or message.message_id == exclude_message_id:
                     continue
                 content = message.content.strip()
-                outgoing = _is_outgoing(raw, self_ids=getattr(self, "_self_ids", None))
+                outgoing = self._is_outgoing_for_chat(raw, username)
                 if outgoing and _is_ai_reply(content):
                     continue
                 if message.is_image:
