@@ -1,6 +1,17 @@
 from types import SimpleNamespace
 
-from wechat_autoreply.wechat_adapter import ShardedWeChatDB, WeChatAdapter
+from wechat_autoreply.wechat_adapter import ShardedWeChatDB, WeChatAdapter, _is_ai_reply, _is_outgoing
+
+
+def test_ai_reply_prefix_is_case_insensitive_and_allows_leading_whitespace():
+    assert _is_ai_reply(" AI：不应读取")
+    assert _is_ai_reply("ai: 不应读取")
+    assert not _is_ai_reply("A.I. 不是自动回复前缀")
+
+
+def test_outgoing_uses_the_v4_sent_status():
+    assert _is_outgoing({"real_sender_id": 6, "status": 2}, self_ids={"wxid_me"})
+    assert not _is_outgoing({"real_sender_id": 6, "status": 4}, self_ids={"wxid_me"})
 
 
 def _adapter(messages):

@@ -70,6 +70,7 @@ try {
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $exe
     $shortcut.WorkingDirectory = $appDir
+    $shortcut.IconLocation = "$(Join-Path $root 'assets\wechat_autoreply_pixel.ico'),0"
     $shortcut.Description = "Start WeChat AI auto-reply"
     $shortcut.Save()
 

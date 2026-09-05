@@ -30,9 +30,8 @@ def _is_outgoing(
     """识别当前账号自己发出的消息，防止自动回复形成自我循环。
 
     ``origin_source`` 表示消息来源渠道，并不是收发方向；不同版本的
-    微信会给它写入 1、2、3、5 等多个值。微信 4.x 的消息表使用
-    ``real_sender_id=2`` 表示当前账号；因此只使用发送者字段判断，
-    不根据 ``origin_source`` 猜测方向。
+    微信会给它写入 1、2、3、5 等多个值。微信 4.x 中 ``status=2``
+    表示本机已发送；旧适配器和部分记录仍使用 ``real_sender_id=2``。
     """
     explicit_false = False
     for key in ("is_self", "is_send", "is_sender", "IsSender"):
@@ -44,8 +43,13 @@ def _is_outgoing(
         if value in {"0", "false", "no", "n", "off"}:
             explicit_false = True
 
+    try:
+        if int(raw.get("status")) == 2:
+            return True
+    except (TypeError, ValueError):
+        pass
+
     # 适配器原始消息通常来自 real_sender_id，转换后为 sender_id。
-    # 2 是 wechatauto 对当前账号的稳定标识，与消息库分片无关。
     sender_keys = ("sender_id", "real_sender_id", "senderId", "realSenderId")
     has_sender = False
     for key in sender_keys:
@@ -81,7 +85,7 @@ def _is_outgoing(
 
 def _is_ai_reply(content: str) -> bool:
     """自动回复都由发送层统一加前缀，以此与用户手动发言区分。"""
-    return content.lstrip().startswith(("AI：", "AI:"))
+    return content.lstrip().casefold().startswith(("ai：", "ai:"))
 
 
 def _message_identity(raw: dict[str, Any]) -> tuple[str, str] | None:

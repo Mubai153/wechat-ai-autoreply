@@ -8,6 +8,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPEC).resolve().parent
 vendor_dir = project_dir / ".vendor" / "wechatauto-replica"
+icon_path = project_dir / "assets" / "wechat_autoreply_pixel.ico"
 sys.path.insert(0, str(vendor_dir))
 hiddenimports = collect_submodules("wechatauto")
 datas = collect_data_files("wechatauto") + collect_data_files("uiautomation")
@@ -31,6 +32,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="微信自动回复",
+    icon=str(icon_path),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
