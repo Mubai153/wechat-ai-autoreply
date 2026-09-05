@@ -245,6 +245,10 @@ class Settings:
     local_memory_path: Path | None = None
     local_memory_max_results: int = 6
     local_memory_max_chars: int = 800
+    web_search_enabled: bool = False
+    searxng_base_url: str = "http://127.0.0.1:8080"
+    web_search_max_results: int = 5
+    web_search_timeout_seconds: int = 15
     # 新配置优先使用 WECHAT_TARGETS；保留 wechat_target 兼容旧版调用方。
     wechat_targets: tuple[str, ...] = ()
     # 独立方案保存在 data/reply_profiles.json，不与包含凭据的 .env 混放。
@@ -410,6 +414,10 @@ class Settings:
             local_memory_path=memory_path,
             local_memory_max_results=max(1, _int("LOCAL_MEMORY_MAX_RESULTS", 6)),
             local_memory_max_chars=max(100, _int("LOCAL_MEMORY_MAX_CHARS", 800)),
+            web_search_enabled=_bool("WEB_SEARCH_ENABLED", False),
+            searxng_base_url=(os.getenv("SEARXNG_BASE_URL", "http://127.0.0.1:8080").strip() or "http://127.0.0.1:8080").rstrip("/"),
+            web_search_max_results=max(1, _int("WEB_SEARCH_MAX_RESULTS", 5)),
+            web_search_timeout_seconds=max(3, _int("WEB_SEARCH_TIMEOUT_SECONDS", 15)),
             wechat_targets=tuple(targets),
             reply_profiles=profiles,
             contact_profile_assignments=assignments,
@@ -452,6 +460,12 @@ class Settings:
                 missing.append("LOCAL_MEMORY_PATH")
             elif not self.local_memory_path.is_file():
                 raise ValueError(f"找不到本地聊天记忆文件：{self.local_memory_path}")
+        if self.web_search_enabled:
+            if self.llm_provider != "lmstudio":
+                raise ValueError("联网搜索仅支持 LLM_PROVIDER=lmstudio")
+            route = urlparse(self.searxng_base_url)
+            if route.scheme not in {"http", "https"} or route.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                raise ValueError("SEARXNG_BASE_URL 必须是本机回环地址")
         targets = self.target_contacts
         if not targets:
             missing.append("WECHAT_TARGETS（或 WECHAT_TARGET）")

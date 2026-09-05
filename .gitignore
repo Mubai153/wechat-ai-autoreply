@@ -14,6 +14,8 @@ data/persona_prompt.md
 data/logs/
 .vendor/
 build/
+build-dist-temp/
+build-work-temp/
 dist/
 design-review/
 logs/

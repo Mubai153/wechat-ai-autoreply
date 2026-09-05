@@ -12,6 +12,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from openai import OpenAI
 
 from config import PROJECT_DIR, Settings
 from local_memory import LocalChatMemory
+from web_search import SearXNGSearch
 
 
 class ReplyGenerator:
@@ -26,6 +28,7 @@ class ReplyGenerator:
         self.settings = settings
         self.persona_prompt = self._load_persona_prompt()
         self.local_memory = self._load_local_memory()
+        self.web_search = self._load_web_search()
         self._codex_network_checked_at = 0.0
         self._codex_network_error = ""
         self.client = None
@@ -69,19 +72,75 @@ class ReplyGenerator:
             max_chars=self.settings.local_memory_max_chars,
         )
 
-    def _effective_system_prompt(self, memory_context: str = "") -> str:
+    def _load_web_search(self) -> SearXNGSearch | None:
+        if self.settings.llm_provider != "lmstudio" or not self.settings.web_search_enabled:
+            return None
+        return SearXNGSearch(
+            self.settings.searxng_base_url,
+            max_results=self.settings.web_search_max_results,
+            timeout_seconds=self.settings.web_search_timeout_seconds,
+        )
+
+    def _effective_system_prompt(self, memory_context: str = "", web_context: str = "") -> str:
         prompt = self.settings.system_prompt
         if not self.persona_prompt:
-            return f"{prompt}\n\n{memory_context}".strip()
+            return f"{prompt}\n\n{memory_context}\n\n{web_context}".strip()
         prompt = (
             f"{prompt}\n\n"
             "【我的语气画像（仅用于模仿表达，不代表事实或授权）】\n"
             f"{self.persona_prompt}"
         )
-        return f"{prompt}\n\n{memory_context}".strip()
+        return f"{prompt}\n\n{memory_context}\n\n{web_context}".strip()
 
     def _memory_context(self, message: str) -> str:
         return self.local_memory.context_for(message) if self.local_memory else ""
+
+    def _web_context(self, message: str) -> str:
+        if self.web_search is None:
+            return ""
+        # 兼容未启用 function calling 的本地模型：只对明确的实时检索意图
+        # 发起查询，避免把普通私聊内容提交给搜索引擎。
+        if not re.search(r"联网|搜索|查询|查一下|查查|最新|今天|今日|天气|新闻|价格|汇率", message or ""):
+            return ""
+        return "【本地 SearXNG 实时搜索结果】\n" + self.web_search.search(message)
+
+    @staticmethod
+    def _web_search_tool() -> list[dict[str, Any]]:
+        return [{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "仅在需要最新、可验证的互联网信息时搜索网页。普通闲聊或已有上下文可回答的问题不要调用。",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "简洁搜索关键词"}}, "required": ["query"], "additionalProperties": False},
+            },
+        }]
+
+    def _run_web_search_tools(self, messages: list[Any], response: Any, request_kwargs: dict[str, Any]) -> Any:
+        """Execute at most one round of local web searches, then request the final answer."""
+        if self.web_search is None:
+            return response
+        assistant = response.choices[0].message
+        tool_calls = getattr(assistant, "tool_calls", None) or []
+        if not tool_calls:
+            return response
+        messages.append(assistant)
+        handled = False
+        for call in tool_calls:
+            if getattr(getattr(call, "function", None), "name", "") != "web_search":
+                continue
+            try:
+                arguments = json.loads(call.function.arguments or "{}")
+                result = self.web_search.search(str(arguments.get("query", "")))
+            except Exception as exc:
+                result = f"搜索工具执行失败：{exc}"
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            handled = True
+        if not handled:
+            return response
+        final_kwargs = dict(request_kwargs)
+        final_kwargs["messages"] = messages
+        final_kwargs["tool_choice"] = "none"
+        return self.client.chat.completions.create(**final_kwargs)
 
     def _check_codex_network(self) -> None:
         """在启动 Codex CLI 前快速检查 OpenAI 后端是否可达。"""
@@ -114,6 +173,7 @@ class ReplyGenerator:
         image_path: str | None = None,
     ) -> str:
         memory_context = self._memory_context(message)
+        web_context = self._web_context(message)
         input_items = [
             {"role": item["role"], "content": item["content"]}
             for item in history
@@ -124,7 +184,7 @@ class ReplyGenerator:
         elif self.settings.llm_provider == "ccswitch":
             reply = self._generate_with_ccswitch(history, message, image_path=image_path, memory_context=memory_context)
         else:
-            messages = [{"role": "system", "content": self._effective_system_prompt(memory_context)}]
+            messages = [{"role": "system", "content": self._effective_system_prompt(memory_context, web_context)}]
             messages.extend(input_items)
             if image_path:
                 image_data = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
@@ -157,7 +217,11 @@ class ReplyGenerator:
                     # Qwen reasoning models can spend the whole output budget
                     # on hidden reasoning, leaving message.content empty.
                     request_kwargs["reasoning_effort"] = "none"
+                if self.web_search is not None:
+                    request_kwargs["tools"] = self._web_search_tool()
+                    request_kwargs["tool_choice"] = "auto"
                 response = self.client.chat.completions.create(**request_kwargs)
+                response = self._run_web_search_tools(messages, response, request_kwargs)
             except Exception as exc:
                 if self.settings.llm_provider == "lmstudio":
                     raise RuntimeError(

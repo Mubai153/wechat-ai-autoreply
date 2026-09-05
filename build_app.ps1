@@ -56,6 +56,19 @@ function Restore-RuntimeState {
     }
 }
 
+function Ensure-BundledData {
+    # Preserve mutable packaged state, but add newly generated read-only assets
+    # (persona and local memory) when an older package did not have them yet.
+    foreach ($relativePath in @('persona_prompt.md', 'raw\my_wechat_messages.jsonl')) {
+        $sourcePath = Join-Path (Join-Path $root 'data') $relativePath
+        $destinationPath = Join-Path (Join-Path $appDir 'data') $relativePath
+        if ((Test-Path -LiteralPath $sourcePath) -and -not (Test-Path -LiteralPath $destinationPath)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPath) | Out-Null
+            Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
+        }
+    }
+}
+
 try {
     & $python -m PyInstaller --noconfirm --clean $spec
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exe)) {
@@ -63,6 +76,7 @@ try {
     }
 
     Restore-RuntimeState
+    Ensure-BundledData
 
     # Create a clickable shortcut in the project folder.
     $shell = New-Object -ComObject WScript.Shell
@@ -79,6 +93,7 @@ try {
 } catch {
     # Even a failed clean build must not discard the last packaged runtime data.
     Restore-RuntimeState
+    Ensure-BundledData
     throw
 } finally {
     if (Test-Path -LiteralPath $runtimeBackup) {

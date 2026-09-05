@@ -154,6 +154,34 @@ LMSTUDIO_API_KEY=lm-studio
 
 在桌面控制台的“AI 与图片”页面，点击“刷新模型”即可自动读取 LM Studio 的本地模型列表，并从下拉菜单选择模型；也可以手动输入模型 ID。`LMSTUDIO_MODEL` 可以填写 LM Studio 页面或 `/v1/models` 返回的模型 ID；留空时程序会在第一次生成回复前自动选择返回列表中的第一个模型。LM Studio 必须保持服务器已启动并且已经加载模型。程序对 LM Studio 请求关闭隐藏思考，以避免 Qwen 推理模型耗尽回复字数上限；图片理解还需要加载支持视觉输入的模型。
 
+#### 本地聊天记忆与联网搜索（可选）
+
+聊天记忆只在 `LLM_PROVIDER=lmstudio` 时从本机 JSONL 文件检索相关的本人历史表达；不会发送到 CC Switch、Codex 或其他云端接口。要启用它，在 `.env` 加入：
+
+```dotenv
+LOCAL_MEMORY_ENABLED=true
+LOCAL_MEMORY_PATH=data/raw/my_wechat_messages.jsonl
+LOCAL_MEMORY_MAX_RESULTS=6
+LOCAL_MEMORY_MAX_CHARS=800
+```
+
+联网搜索同样只支持 LM Studio，并通过电脑本机的 SearXNG 容器转发。先启动 Docker Desktop，再在项目根目录执行：
+
+```powershell
+docker compose -f searxng\docker-compose.yml up -d
+```
+
+然后在 `.env` 加入：
+
+```dotenv
+WEB_SEARCH_ENABLED=true
+SEARXNG_BASE_URL=http://127.0.0.1:8080
+WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_TIMEOUT_SECONDS=15
+```
+
+服务只绑定到 `127.0.0.1`，不会向局域网开放。模型支持 function calling 时可自行调用搜索；不支持时，程序会在“搜索、最新、天气、新闻、价格、汇率”等明确实时意图中自动补充搜索结果。搜索请求仍会被 SearXNG 转发给它启用的公开搜索引擎，因此不要把私人聊天原文当作搜索关键词。关闭服务可执行 `docker compose -f searxng\docker-compose.yml down`；关闭功能只需把 `WEB_SEARCH_ENABLED` 改为 `false` 并重启程序。
+
 ### 方式 D：OpenAI 兼容接口
 
 接口必须兼容 OpenAI Chat Completions。`LLM_BASE_URL` 填写到 API 版本层（通常以 `/v1` 结尾），不要填写完整的 `/chat/completions` 路径：
