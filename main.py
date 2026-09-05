@@ -190,6 +190,13 @@ class ReplyService:
                     media_dir.mkdir(parents=True, exist_ok=True)
                     if message.local_id is None:
                         logger.info("图片消息缺少 local_id，跳过图片识别")
+                        self._emit(
+                            "skipped",
+                            reason="图片消息缺少本地消息 ID",
+                            chat_name=message.chat_name,
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                        )
                         continue
                     image_path = self.adapter.download_image(
                         message.local_id,
@@ -237,6 +244,7 @@ class ReplyService:
                     )
                     self._send_message(message, reply)
                     logger.info("已自动回复：%s", reply)
+                    self.storage.add_message(message.chat_id, "assistant", reply)
                     self._emit(
                         "generated",
                         reply=reply,
@@ -246,7 +254,6 @@ class ReplyService:
                         message_id=message.message_id,
                         input_content=message.content,
                     )
-                self.storage.add_message(message.chat_id, "assistant", reply)
             except Exception as exc:
                 logger.exception("处理消息失败；本条消息不会自动重试")
                 self._emit(
@@ -323,7 +330,14 @@ class ReplyService:
         if not text:
             raise RuntimeError("回复内容为空")
         message = request[0]
-        self._emit("sending", reply=text, manual=True)
+        self._emit(
+            "sending",
+            reply=text,
+            manual=True,
+            chat_name=message.chat_name,
+            chat_id=message.chat_id,
+            message_id=getattr(message, "message_id", ""),
+        )
         self._send_message(message, text)
         # 写入本地状态以保持回复冷却逻辑一致；微信记忆层仍会过滤 AI 回复。
         self.storage.add_message(message.chat_id, "assistant", text)

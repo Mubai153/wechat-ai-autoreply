@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import queue
 import threading
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +67,33 @@ def normalize_numeric_setting(label: str, env_key: str, value: str) -> str:
     return str(number)
 
 
+def extract_lmstudio_model_ids(payload: object) -> list[str]:
+    """Extract chat-capable model IDs from LM Studio model-list responses."""
+    if not isinstance(payload, dict):
+        return []
+    native_entries = payload.get("models")
+    is_native_response = isinstance(native_entries, list)
+    entries = native_entries if is_native_response else payload.get("data")
+    if not isinstance(entries, list):
+        return []
+    models: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if is_native_response and str(entry.get("type", "")).strip().lower() != "llm":
+            continue
+        model_id = str(entry.get("key") or entry.get("id") or "").strip()
+        if not is_native_response and any(
+            marker in model_id.casefold() for marker in ("embedding", "embed", "rerank")
+        ):
+            continue
+        if model_id and model_id not in seen:
+            models.append(model_id)
+            seen.add(model_id)
+    return models
+
+
 def format_bytes(size: int) -> str:
     value = float(max(0, size))
     for unit in ("B", "KB", "MB", "GB"):
@@ -76,12 +107,18 @@ def directory_size(path: Path) -> int:
     if not path.exists():
         return 0
     total = 0
-    for item in path.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except OSError:
-            continue
+    try:
+        for directory, _subdirs, filenames in os.walk(
+            path, followlinks=False, onerror=lambda _error: None
+        ):
+            for filename in filenames:
+                try:
+                    total += (Path(directory) / filename).stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        # 目录可能在扫描过程中被清理或权限被收紧；已统计部分仍可展示。
+        pass
     return total
 
 
@@ -279,6 +316,9 @@ class AutoReplyApp:
         self._storage_scan_running = False
         self._page_resize_job: str | None = None
         self._pending_page_size = (1, 1)
+        self._lmstudio_model_combo: Any | None = None
+        self._lmstudio_model_status: tk.Label | None = None
+        self._lmstudio_model_request_id = 0
 
         self._read_mode_default()
         self._build_shell()
@@ -557,7 +597,7 @@ class AutoReplyApp:
                     ("Codex 命令", "CODEX_COMMAND", "entry", "通常保持 codex"),
                     ("Codex 模型", "CODEX_MODEL", "entry", "留空时使用 Codex 当前默认模型"),
                     ("LM Studio 地址", "LMSTUDIO_BASE_URL", "entry", "默认 http://127.0.0.1:1234/v1；需先在 LM Studio 启动本地服务器"),
-                    ("LM Studio 模型", "LMSTUDIO_MODEL", "entry", "填写 LM Studio 的模型 ID；留空时自动使用 /v1/models 返回的第一个模型"),
+                    ("LM Studio 模型", "LMSTUDIO_MODEL", "lmstudio_model", "自动读取本地模型列表；可从下拉菜单选择，也可手动输入模型 ID"),
                     ("LM Studio Key", "LMSTUDIO_API_KEY", "secret", "LM Studio 通常可填写 lm-studio；仅保存在本机 .env"),
                     ("调用超时（秒）", "CODEX_TIMEOUT_SECONDS", "entry", "建议不少于 120 秒"),
                     ("兼容接口地址", "LLM_BASE_URL", "entry", "仅 openai_compatible 模式需要"),
@@ -654,6 +694,33 @@ class AutoReplyApp:
                 menu = tk.OptionMenu(control, var, *options)
                 menu.configure(bg="#F8FAF8", fg=COLORS["text"], activebackground=COLORS["soft"], relief="flat", highlightbackground=COLORS["line"], width=26, font=(FONT, 9))
                 menu.pack(side="right")
+                self.form_vars[env_key] = var
+            elif kind == "lmstudio_model":
+                control.grid_columnconfigure(0, weight=1)
+                var = tk.StringVar(value=raw)
+                from tkinter import ttk
+
+                combo = ttk.Combobox(
+                    control,
+                    textvariable=var,
+                    state="normal",
+                    width=42,
+                )
+                combo.grid(row=0, column=0, sticky="ew", ipady=5)
+                self._button(control, "刷新模型", self._refresh_lmstudio_models).grid(
+                    row=0, column=1, padx=(8, 0)
+                )
+                status = tk.Label(
+                    control,
+                    text="打开页面后自动读取",
+                    bg=COLORS["panel"],
+                    fg=COLORS["muted"],
+                    font=(FONT, 8),
+                    anchor="w",
+                )
+                status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+                self._lmstudio_model_combo = combo
+                self._lmstudio_model_status = status
                 self.form_vars[env_key] = var
             else:
                 var = tk.StringVar(value=raw)
@@ -784,6 +851,8 @@ class AutoReplyApp:
         self.pages[key].place(x=0, y=0, width=width, height=height)
         self.selected_page = key
         self.root.after_idle(self._apply_page_resize)
+        if key == "ai":
+            self.root.after_idle(self._refresh_lmstudio_models)
         title = next((label for label, nav_key, _icon in self.NAV_ITEMS if nav_key == key), "设置")
         self.breadcrumb.configure(text=f"{title}  /  {'实时概览' if key == 'dashboard' else '本机配置'}")
         for nav_key, button in self.nav_buttons.items():
@@ -793,6 +862,63 @@ class AutoReplyApp:
             self._render_logs()
         if key == "data":
             self._refresh_storage_stats()
+
+    def _refresh_lmstudio_models(self) -> None:
+        """Read LM Studio models off the UI thread and refresh the combo box."""
+        combo = self._lmstudio_model_combo
+        status = self._lmstudio_model_status
+        if combo is None or status is None:
+            return
+        base_var = self.form_vars.get("LMSTUDIO_BASE_URL")
+        base_url = str(base_var.get()).strip() if isinstance(base_var, tk.Variable) else ""
+        base_url = base_url.rstrip("/") or "http://127.0.0.1:1234/v1"
+        self._lmstudio_model_request_id += 1
+        request_id = self._lmstudio_model_request_id
+        status.configure(text="正在读取 LM Studio 模型…", fg=COLORS["muted"])
+
+        def fetch() -> None:
+            try:
+                parts = urlsplit(base_url)
+                root_url = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+                endpoints = []
+                if root_url:
+                    endpoints.append(f"{root_url}/api/v1/models")
+                endpoints.append(f"{base_url}/models")
+                last_error: Exception | None = None
+                models: list[str] = []
+                for endpoint in endpoints:
+                    try:
+                        request = urllib.request.Request(
+                            endpoint,
+                            headers={"Accept": "application/json"},
+                        )
+                        with urllib.request.urlopen(request, timeout=6) as response:
+                            payload = json.loads(response.read().decode("utf-8"))
+                        models = extract_lmstudio_model_ids(payload)
+                        if models:
+                            break
+                        last_error = RuntimeError(f"{endpoint} 没有返回可用模型")
+                    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                        last_error = exc
+                if not models:
+                    raise last_error or RuntimeError("模型接口不可用")
+                self.ui_queue.put(
+                    {
+                        "kind": "event",
+                        "event": "lmstudio_models",
+                        "payload": {"request_id": request_id, "models": models},
+                    }
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
+                self.ui_queue.put(
+                    {
+                        "kind": "event",
+                        "event": "lmstudio_models_error",
+                        "payload": {"request_id": request_id, "message": str(exc)},
+                    }
+                )
+
+        threading.Thread(target=fetch, name="gui-lmstudio-models", daemon=True).start()
 
     def _paint_mode_buttons(self) -> None:
         auto = self.mode_auto.get()
@@ -905,7 +1031,26 @@ class AutoReplyApp:
 
     def _handle_event(self, event: str, payload: dict[str, Any]) -> None:
         now = datetime.now().strftime("%H:%M:%S")
-        if event == "service_started":
+        if event == "lmstudio_models":
+            if payload.get("request_id") != self._lmstudio_model_request_id:
+                return
+            models = [str(model) for model in payload.get("models", []) if str(model).strip()]
+            combo = self._lmstudio_model_combo
+            status = self._lmstudio_model_status
+            if combo is not None and status is not None:
+                current = str(self.form_vars["LMSTUDIO_MODEL"].get()).strip()
+                combo.configure(values=models)
+                self.form_vars["LMSTUDIO_MODEL"].set(current if current in models else models[0])
+                status.configure(text=f"已读取 {len(models)} 个可聊天模型，可下拉选择", fg=COLORS["green_dark"])
+        elif event == "lmstudio_models_error":
+            if payload.get("request_id") != self._lmstudio_model_request_id:
+                return
+            if self._lmstudio_model_status is not None:
+                self._lmstudio_model_status.configure(
+                    text=f"读取失败：{payload.get('message', '请确认 LM Studio Server 已启动')}",
+                    fg=COLORS["warning"],
+                )
+        elif event == "service_started":
             self.service_title.configure(text="正在监听")
             self.start_button.configure(text="停止监听", state="normal")
             self.top_connection.configure(text="●  微信已连接", fg=COLORS["green_dark"])
@@ -1030,9 +1175,11 @@ class AutoReplyApp:
         if service is None:
             messagebox.showinfo("无法重新生成", "请先启动监听，并等待收到一条消息。", parent=self.root)
             return
+        message_id = self.last_message_id
+
         def run() -> None:
             try:
-                service.regenerate_last(self.last_message_id)
+                service.regenerate_last(message_id)
             except Exception as exc:
                 self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
         threading.Thread(target=run, name="gui-regenerate", daemon=True).start()
@@ -1046,10 +1193,12 @@ class AutoReplyApp:
             messagebox.showinfo("暂无回复", "目前没有可发送的回复。", parent=self.root)
             return
         self.send_reply_button.configure(state="disabled", bg=COLORS["soft"], fg=COLORS["muted_2"], cursor="arrow")
+        reply = self.last_reply
+        message_id = self.last_message_id
 
         def run() -> None:
             try:
-                service.send_reply(self.last_reply, self.last_message_id)
+                service.send_reply(reply, message_id)
             except Exception as exc:
                 self.ui_queue.put({"kind": "event", "event": "error", "payload": {"message": str(exc)}})
 

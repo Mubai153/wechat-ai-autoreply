@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from wechat_autoreply.wechat_adapter import WeChatAdapter
+from wechat_autoreply.wechat_adapter import ShardedWeChatDB, WeChatAdapter
 
 
 def _adapter(messages):
@@ -50,3 +50,49 @@ def test_history_excludes_current_message_and_normalizes_media():
         {"role": "user", "content": "[动画表情]"},
         {"role": "user", "content": "[图片]"},
     ]
+
+
+def test_sharded_database_deduplicates_copied_message_rows():
+    row = {
+        "local_id": 7,
+        "local_type": 1,
+        "real_sender_id": 4,
+        "create_time": 123,
+        "message_content": "同一条消息",
+        "source": "",
+        "packed_info_data": "",
+        "compress_content": "",
+        "sort_seq": 99,
+        "origin_source": 2,
+        "status": 0,
+    }
+
+    class Connection:
+        def execute(self, query, _params):
+            if "sqlite_master" in query:
+                return self
+            return self
+
+        def fetchone(self):
+            return (1,)
+
+        def fetchall(self):
+            return [row]
+
+        @staticmethod
+        def close():
+            return None
+
+    class Database:
+        @staticmethod
+        def _message_dbs():
+            return ["message_0.db", "message_1.db"]
+
+        @staticmethod
+        def _open(_path):
+            return Connection()
+
+    sharded = ShardedWeChatDB.__new__(ShardedWeChatDB)
+    sharded._db = Database()
+
+    assert sharded._rows("wxid_test", limit=20) == [row]

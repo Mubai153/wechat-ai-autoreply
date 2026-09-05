@@ -84,6 +84,15 @@ def _is_ai_reply(content: str) -> bool:
     return content.lstrip().startswith(("AI：", "AI:"))
 
 
+def _message_identity(raw: dict[str, Any]) -> tuple[str, str] | None:
+    """返回可用于区分新旧数据库记录的稳定标识。"""
+    for key in ("sort_seq", "server_id", "local_id", "message_id", "msg_id"):
+        value = raw.get(key)
+        if value is not None and str(value).strip():
+            return key, str(value).strip()
+    return None
+
+
 class ShardedWeChatDB:
     """让 wechatauto 的监听器合并同一会话分布在多个消息库的记录。
 
@@ -132,6 +141,24 @@ class ShardedWeChatDB:
                     rows.extend(conn.execute(query, (since_seq, limit)).fetchall())
             finally:
                 conn.close()
+
+        # 会话切换分片时，同一条消息可能同时存在于旧、新数据库中。
+        # 先按稳定字段去重，否则监听器会重复派发，历史上下文也会重复。
+        unique_rows: list[Any] = []
+        seen: set[tuple[Any, ...]] = set()
+        for row in rows:
+            identity = (
+                row["sort_seq"],
+                row["local_id"],
+                row["real_sender_id"],
+                row["create_time"],
+                row["message_content"],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique_rows.append(row)
+        rows = unique_rows
 
         if since_seq is None:
             rows.sort(key=lambda row: row["sort_seq"], reverse=True)
@@ -460,7 +487,15 @@ class WeChatAdapter:
         chat_id: str | None = None,
         chat_name: str | None = None,
     ) -> None:
-        target_username = self.target_username_for(chat_id, chat_name) or self.target_username
+        target_username = self.target_username_for(chat_id, chat_name)
+        if target_username is None:
+            if chat_id or chat_name:
+                raise RuntimeError(
+                    f"拒绝发送到未配置的会话：{chat_name or chat_id}"
+                )
+            target_username = self.target_username
+        if not target_username:
+            raise RuntimeError("没有可发送的目标联系人")
         target_name = next(
             (name for name, username in getattr(self, "target_usernames", {}).items() if username == target_username),
             getattr(getattr(self, "settings", None), "wechat_target", ""),
@@ -473,6 +508,24 @@ class WeChatAdapter:
             self._send_text_locked(text, target_username, target_name)
 
     def _send_text_locked(self, text: str, target_username: str, target_name: str) -> None:
+        # 发送前建立确认基线。否则连续发送相同文案时，轮询可能命中数据库里
+        # 的旧消息，并把一次实际失败误报为成功。
+        before_messages = self.db.get_messages(target_username, limit=20)
+        before_ids = {
+            identity
+            for message in before_messages
+            if isinstance(message, dict)
+            for identity in (_message_identity(message),)
+            if identity is not None
+        }
+        before_matching = sum(
+            1
+            for message in before_messages
+            if isinstance(message, dict)
+            and _is_outgoing(message, self_ids=getattr(self, "_self_ids", None))
+            and (message.get("content") or "").strip() == text.strip()
+        )
+
         # 默认使用项目内的无鼠标 UIA 路径。只有显式允许时才回退到上游
         # 坐标/OCR 方案；这样 UIA 不可用时会快速报错，不会突然抢鼠标。
         settings = getattr(self, "settings", None)
@@ -519,11 +572,19 @@ class WeChatAdapter:
 
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            messages = self.db.get_messages(target_username, limit=5)
-            if any(
-                _is_outgoing(message) and (message.get("content") or "").strip() == text.strip()
+            messages = self.db.get_messages(target_username, limit=20)
+            matching = [
+                message
                 for message in messages
-            ):
+                if isinstance(message, dict)
+                and _is_outgoing(message, self_ids=getattr(self, "_self_ids", None))
+                and (message.get("content") or "").strip() == text.strip()
+            ]
+            if any(
+                (identity := _message_identity(message)) is not None
+                and identity not in before_ids
+                for message in matching
+            ) or len(matching) > before_matching:
                 return
             time.sleep(0.5)
         raise RuntimeError("微信已执行发送操作，但数据库未确认该消息")

@@ -6,6 +6,7 @@ from wechat_autoreply.wechat_adapter import WeChatAdapter
 
 def test_adapter_uses_configured_remark_for_background_search(monkeypatch):
     created_with = []
+    state = {"sent": False}
 
     class FakeSender:
         def __init__(self, target):
@@ -13,6 +14,7 @@ def test_adapter_uses_configured_remark_for_background_search(monkeypatch):
 
         @staticmethod
         def send_text(_text):
+            state["sent"] = True
             return {"status": "成功", "message": "已发送"}
 
     monkeypatch.setattr(background_sender_module, "BackgroundWeChatSender", FakeSender)
@@ -28,8 +30,12 @@ def test_adapter_uses_configured_remark_for_background_search(monkeypatch):
 
     class FakeDB:
         @staticmethod
-        def get_messages(_user, limit=5):
-            return [{"origin_source": 1, "content": "AI：测试"}]
+        def get_messages(_user, limit=20):
+            if not state["sent"]:
+                return []
+            return [
+                {"sort_seq": 2, "origin_source": 1, "content": "AI：测试"}
+            ]
 
     adapter.db = FakeDB()
     adapter.send_text("AI：测试")

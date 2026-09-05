@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -17,7 +18,18 @@ def cleanup_media_cache(
     """
     if not root.exists() or not root.is_dir():
         return 0, 0
-    files = [p for p in root.rglob("*") if p.is_file()]
+    files: list[Path] = []
+    directories: list[Path] = []
+    try:
+        for directory, subdirs, filenames in os.walk(
+            root, followlinks=False, onerror=lambda _error: None
+        ):
+            base = Path(directory)
+            directories.extend(base / name for name in subdirs)
+            files.extend(base / name for name in filenames)
+    except OSError:
+        # 缓存可能被其他线程或用户同时清理；继续处理已枚举到的文件。
+        pass
     now = time.time()
     cutoff = now - max(0, retention_days) * 86400
     removed = 0
@@ -27,7 +39,7 @@ def cleanup_media_cache(
         try:
             size = path.stat().st_size
             mtime = path.stat().st_mtime
-            if mtime < cutoff:
+            if retention_days == 0 or mtime < cutoff:
                 path.unlink()
                 removed += 1
                 freed += size
@@ -50,7 +62,7 @@ def cleanup_media_cache(
                 continue
 
     # 只移除缓存目录内部的空子目录，不会移除 root 本身。
-    for directory in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
         try:
             directory.rmdir()
         except OSError:

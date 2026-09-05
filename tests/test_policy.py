@@ -1,5 +1,8 @@
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
 
 from config import Settings
 from main import add_ai_prefix
@@ -138,6 +141,7 @@ def test_send_failure_is_not_reported_as_success():
         "status": "失败",
         "message": "输入框不可用",
     }
+    adapter.db = SimpleNamespace(get_messages=lambda *_args, **_kwargs: [])
 
     try:
         adapter.send_text("AI：测试")
@@ -148,18 +152,58 @@ def test_send_failure_is_not_reported_as_success():
 
 
 def test_send_success_is_verified_with_outgoing_origin():
+    state = {"sent": False}
     adapter = WeChatAdapter.__new__(WeChatAdapter)
     adapter.target_username = "wxid_test"
-    adapter._quick_send = lambda *_args, **kwargs: {
-        "status": "成功",
-        "message": "已发送",
-        "verify_arg": kwargs.get("verify"),
-    }
+
+    def quick_send(*_args, **kwargs):
+        state["sent"] = True
+        return {
+            "status": "成功",
+            "message": "已发送",
+            "verify_arg": kwargs.get("verify"),
+        }
+
+    adapter._quick_send = quick_send
 
     class FakeDB:
         @staticmethod
-        def get_messages(_user, limit=5):
-            return [{"origin_source": 1, "content": "AI：测试"}]
+        def get_messages(_user, limit=20):
+            if not state["sent"]:
+                return []
+            return [
+                {"sort_seq": 2, "origin_source": 1, "content": "AI：测试"}
+            ]
 
     adapter.db = FakeDB()
     adapter.send_text("AI：测试")
+
+
+def test_explicit_unknown_chat_is_never_routed_to_first_contact():
+    adapter = WeChatAdapter.__new__(WeChatAdapter)
+    adapter.target_username = "wxid_first"
+    adapter.target_usernames = {"小明": "wxid_first", "小红": "wxid_second"}
+
+    with pytest.raises(RuntimeError, match="拒绝发送到未配置的会话"):
+        adapter.send_text("AI：测试", chat_id="wxid_unknown", chat_name="陌生人")
+
+
+def test_old_identical_message_does_not_confirm_new_send(monkeypatch):
+    adapter = WeChatAdapter.__new__(WeChatAdapter)
+    adapter.target_username = "wxid_test"
+    adapter.settings = SimpleNamespace(
+        wechat_background_mode=False,
+        wechat_allow_mouse_fallback=False,
+    )
+    adapter._quick_send = lambda *_args, **_kwargs: {
+        "status": "成功",
+        "message": "已执行",
+    }
+    old = {"sort_seq": 10, "sender_id": 2, "content": "AI：重复内容"}
+    adapter.db = SimpleNamespace(get_messages=lambda *_args, **_kwargs: [old])
+    times = iter((0.0, 0.0, 11.0))
+    monkeypatch.setattr("wechat_autoreply.wechat_adapter.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("wechat_autoreply.wechat_adapter.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="数据库未确认"):
+        adapter.send_text("AI：重复内容")

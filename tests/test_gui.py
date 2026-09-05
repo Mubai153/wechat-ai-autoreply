@@ -1,9 +1,17 @@
 import threading
+import json
+import queue
 from types import SimpleNamespace
 
 import pytest
 
-from gui import AutoReplyApp, directory_size, format_bytes, normalize_numeric_setting
+from gui import (
+    AutoReplyApp,
+    directory_size,
+    extract_lmstudio_model_ids,
+    format_bytes,
+    normalize_numeric_setting,
+)
 from main import ReplyService
 
 
@@ -20,6 +28,18 @@ def test_directory_size_counts_nested_files(tmp_path):
     assert directory_size(tmp_path) == 7
 
 
+def test_directory_size_keeps_partial_result_when_scan_fails(tmp_path, monkeypatch):
+    (tmp_path / "a.bin").write_bytes(b"123")
+
+    def interrupted_walk(*_args, **_kwargs):
+        yield str(tmp_path), [], ["a.bin"]
+        raise OSError("目录在扫描中消失")
+
+    monkeypatch.setattr("gui.os.walk", interrupted_walk)
+
+    assert directory_size(tmp_path) == 3
+
+
 def test_empty_optional_numeric_setting_uses_default():
     assert normalize_numeric_setting("图片保留天数", "MEDIA_RETENTION_DAYS", "") == "7"
 
@@ -27,6 +47,75 @@ def test_empty_optional_numeric_setting_uses_default():
 def test_numeric_setting_error_identifies_the_field():
     with pytest.raises(ValueError, match="调用超时（秒）.*CODEX_TIMEOUT_SECONDS"):
         normalize_numeric_setting("调用超时（秒）", "CODEX_TIMEOUT_SECONDS", "不是数字")
+
+
+def test_extract_lmstudio_model_ids_keeps_unique_ids_in_server_order():
+    payload = {
+        "data": [
+            {"id": "qwen/qwen3.5-9b"},
+            {"id": "qwen/qwen3.6-35b-a3b"},
+            {"id": "qwen/qwen3.5-9b"},
+            {"object": "model"},
+        ]
+    }
+
+    assert extract_lmstudio_model_ids(payload) == [
+        "qwen/qwen3.5-9b",
+        "qwen/qwen3.6-35b-a3b",
+    ]
+
+
+def test_extract_lmstudio_native_models_excludes_embeddings():
+    payload = {
+        "models": [
+            {"type": "llm", "key": "qwen/qwen3.5-9b"},
+            {"type": "embedding", "key": "text-embedding-nomic-embed-text-v1.5"},
+        ]
+    }
+
+    assert extract_lmstudio_model_ids(payload) == ["qwen/qwen3.5-9b"]
+
+
+def test_lmstudio_refresh_falls_back_when_native_endpoint_has_no_chat_models(monkeypatch):
+    responses = [
+        {"models": [{"type": "embedding", "key": "embed-model"}]},
+        {"data": [{"id": "chat-model"}]},
+    ]
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("gui.urllib.request.urlopen", lambda *_args, **_kwargs: Response(responses.pop(0)))
+    monkeypatch.setattr("gui.threading.Thread", ImmediateThread)
+    app = AutoReplyApp.__new__(AutoReplyApp)
+    app._lmstudio_model_combo = object()
+    app._lmstudio_model_status = SimpleNamespace(configure=lambda **_kwargs: None)
+    app._lmstudio_model_request_id = 0
+    app.form_vars = {"LMSTUDIO_BASE_URL": SimpleNamespace(get=lambda: "http://127.0.0.1:1234/v1")}
+    app.ui_queue = queue.Queue()
+
+    app._refresh_lmstudio_models()
+
+    event = app.ui_queue.get_nowait()
+    assert event["event"] == "lmstudio_models"
+    assert event["payload"]["models"] == ["chat-model"]
 
 
 def test_send_button_allows_unsent_preview_even_in_auto_mode():
@@ -127,9 +216,56 @@ def test_send_reply_sends_preview_and_records_manual_send():
 
     service.send_reply("AI：测试")
 
-    assert calls[0] == ("sending", {"reply": "AI：测试", "manual": True})
+    assert calls[0] == (
+        "sending",
+        {
+            "reply": "AI：测试",
+            "manual": True,
+            "chat_name": "小明",
+            "chat_id": "wxid_test",
+            "message_id": "",
+        },
+    )
     assert calls[1] == ("send", "AI：测试")
     assert calls[2] == ("store", "wxid_test", "assistant", "AI：测试")
     assert calls[3][0] == "generated"
     assert calls[3][1]["sent"] is True
     assert calls[3][1]["manual"] is True
+
+
+def test_send_reply_ui_freezes_reply_and_message_before_starting_thread(monkeypatch):
+    calls = []
+    pending = []
+
+    class Button:
+        @staticmethod
+        def configure(**_kwargs):
+            return None
+
+    class Service:
+        @staticmethod
+        def send_reply(reply, message_id):
+            calls.append((reply, message_id))
+
+    class DeferredThread:
+        def __init__(self, *, target, **_kwargs):
+            pending.append(target)
+
+        @staticmethod
+        def start():
+            return None
+
+    monkeypatch.setattr("gui.threading.Thread", DeferredThread)
+    app = AutoReplyApp.__new__(AutoReplyApp)
+    app.service = Service()
+    app.send_reply_button = Button()
+    app.last_reply = "AI：第一条"
+    app.last_message_id = "m1"
+    app.ui_queue = __import__("queue").Queue()
+
+    app._send_reply()
+    app.last_reply = "AI：第二条"
+    app.last_message_id = "m2"
+    pending[0]()
+
+    assert calls == [("AI：第一条", "m1")]

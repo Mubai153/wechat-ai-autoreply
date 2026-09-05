@@ -38,3 +38,19 @@ def test_cleanup_enforces_size_limit_oldest_first(tmp_path: Path):
     assert freed == 5
     assert not first.exists()
     assert second.exists()
+
+
+def test_cleanup_continues_with_files_found_before_walk_error(tmp_path: Path, monkeypatch):
+    cached = tmp_path / "cached.bin"
+    cached.write_bytes(b"123")
+
+    def interrupted_walk(*_args, **_kwargs):
+        yield str(tmp_path), [], [cached.name]
+        raise OSError("目录在扫描中消失")
+
+    monkeypatch.setattr("media_cleanup.os.walk", interrupted_walk)
+
+    removed, freed = cleanup_media_cache(tmp_path, retention_days=0, max_bytes=0)
+
+    assert (removed, freed) == (1, 3)
+    assert not cached.exists()

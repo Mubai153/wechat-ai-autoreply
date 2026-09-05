@@ -152,7 +152,7 @@ LMSTUDIO_MODEL=
 LMSTUDIO_API_KEY=lm-studio
 ```
 
-`LMSTUDIO_MODEL` 可以填写 LM Studio 页面或 `/v1/models` 返回的模型 ID；留空时程序会在第一次生成回复前自动选择返回列表中的第一个模型。LM Studio 必须保持服务器已启动并且已经加载模型。程序对 LM Studio 请求关闭隐藏思考，以避免 Qwen 推理模型耗尽回复字数上限；图片理解还需要加载支持视觉输入的模型。
+在桌面控制台的“AI 与图片”页面，点击“刷新模型”即可自动读取 LM Studio 的本地模型列表，并从下拉菜单选择模型；也可以手动输入模型 ID。`LMSTUDIO_MODEL` 可以填写 LM Studio 页面或 `/v1/models` 返回的模型 ID；留空时程序会在第一次生成回复前自动选择返回列表中的第一个模型。LM Studio 必须保持服务器已启动并且已经加载模型。程序对 LM Studio 请求关闭隐藏思考，以避免 Qwen 推理模型耗尽回复字数上限；图片理解还需要加载支持视觉输入的模型。
 
 ### 方式 D：OpenAI 兼容接口
 
