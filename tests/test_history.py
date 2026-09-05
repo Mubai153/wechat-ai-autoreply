@@ -14,6 +14,11 @@ def test_outgoing_uses_the_v4_sent_status():
     assert not _is_outgoing({"real_sender_id": 6, "status": 4}, self_ids={"wxid_me"})
 
 
+def test_incoming_status_wins_over_internal_sender_id_two():
+    # 微信 4.x 可能给对方消息返回 sender_id=2；status=3 才表示这是收到的消息。
+    assert not _is_outgoing({"sender_id": 2, "status": 3})
+
+
 def _adapter(messages):
     class FakeDB:
         @staticmethod

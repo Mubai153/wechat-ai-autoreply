@@ -30,8 +30,10 @@ def _is_outgoing(
     """识别当前账号自己发出的消息，防止自动回复形成自我循环。
 
     ``origin_source`` 表示消息来源渠道，并不是收发方向；不同版本的
-    微信会给它写入 1、2、3、5 等多个值。微信 4.x 中 ``status=2``
-    表示本机已发送；旧适配器和部分记录仍使用 ``real_sender_id=2``。
+    微信会给它写入 1、2、3、5 等多个值。微信 4.x 消息表中
+    ``status=2`` 表示本机已发送，其他明确的 status 按对方消息处理。
+    不能把 ``sender_id=2`` 当作本人：这是消息表里的内部发送者编号，
+    在当前微信版本中对方消息也可能使用该编号。
     """
     explicit_false = False
     for key in ("is_self", "is_send", "is_sender", "IsSender"):
@@ -43,11 +45,14 @@ def _is_outgoing(
         if value in {"0", "false", "no", "n", "off"}:
             explicit_false = True
 
-    try:
-        if int(raw.get("status")) == 2:
-            return True
-    except (TypeError, ValueError):
-        pass
+    # 当前适配器会把消息表的 status 原样带出。只要 status 可解析，
+    # 就以它为唯一方向依据，不能再落入 sender_id=2 的旧兼容判断。
+    status = raw.get("status")
+    if status is not None and str(status).strip():
+        try:
+            return int(status) == 2
+        except (TypeError, ValueError):
+            pass
 
     # 适配器原始消息通常来自 real_sender_id，转换后为 sender_id。
     sender_keys = ("sender_id", "real_sender_id", "senderId", "realSenderId")
